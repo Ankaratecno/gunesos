@@ -46,14 +46,20 @@
             justify-content: center;
             align-items: center;
             min-height: 100vh;
+            min-height: var(--app-h, 100dvh);
             background-color: #f0f2f5; 
             transition: background-color 0.3s ease;
+            overflow: hidden;
         }
 
         .app-container {
             width: 100%;
             height: 100vh;
+            /* Klavye açıldığında görünür alan küçülür: başlık üstte kalsın,
+               sadece mesaj listesi kaysın. */
+            height: var(--app-h, 100dvh);
             max-width: 600px;
+
             background-color: var(--bg-white);
             position: relative;
             overflow: hidden;
@@ -588,9 +594,13 @@
             flex:1; overflow-y:auto;
             padding:14px 14px 12px;
             display:flex; flex-direction:column; gap:8px;
-            background:linear-gradient(180deg, var(--bg-white) 0%, var(--light-green-bg) 280%);
+            background:var(--oo-chat-bg, linear-gradient(180deg, var(--bg-white) 0%, var(--light-green-bg) 280%));
+            background-attachment:local;
         }
         .chat-messages::-webkit-scrollbar { display:none; }
+        /* "yazıyor…" animasyonu daima en altta kalsın (flex order) */
+        .chat-messages > #typingIndicator { order:99999; }
+
         .msg-bubble {
             max-width:78%; padding:9px 13px; border-radius:18px;
             font-size:.92rem; line-height:1.35; word-wrap:break-word;
@@ -613,19 +623,31 @@
         }
         .ci-field {
             flex:1 1 auto; min-width:0;
-            display:flex; align-items:center;
+            display:flex; align-items:flex-end;
             background:#f3f4f6; border-radius:22px;
             padding:4px 6px; gap:2px;
             transition:background .15s;
         }
         .ci-field:focus-within { background:#eef0f3; }
-        .ci-field input {
+        .ci-field input,
+        .ci-field textarea {
             flex:1 1 auto; min-width:0;
             border:none; background:transparent; outline:none;
             font-size:.95rem; color:var(--text-main); font-family:inherit;
-            padding:4px 4px;
+            padding:6px 4px;
         }
-        .ci-field input::placeholder { color:#9ca3af; }
+        /* Mesaj kutusu: yazı sağa kaymaz, satır atlayarak yukarı doğru büyür */
+        .ci-field textarea#chatInput {
+            display:block; resize:none;
+            max-height:132px; overflow-y:auto;
+            line-height:1.38; white-space:pre-wrap;
+            overflow-wrap:break-word; word-break:break-word;
+            scrollbar-width:none;
+        }
+        .ci-field textarea#chatInput::-webkit-scrollbar { width:0; height:0; }
+        .ci-field input::placeholder,
+        .ci-field textarea::placeholder { color:#9ca3af; }
+
         .ci-inner-btn {
             width:32px; height:32px; border-radius:50%;
             background:transparent; border:none; color:var(--text-secondary);
@@ -726,16 +748,82 @@
         .chat-messages .msg-own { justify-content:flex-end; }
         .chat-messages .msg-other,
         .chat-messages .msg-private { justify-content:flex-start; }
-        .chat-messages .msg-own > .msg-bubble {
-            background:var(--primary-green); color:#fff;
-            border-bottom-right-radius:6px;
+        .chat-messages .msg > .msg-bubble {
+            max-width:min(78%, 420px);
+            padding:7px 11px 5px;
+            border-radius:14px;
+            box-shadow:0 1px 2px rgba(15,23,42,.07);
+            font-size:.93rem; line-height:1.38;
+            overflow-wrap:break-word; word-break:normal; white-space:pre-wrap;
         }
+        .chat-messages .msg-own > .msg-bubble {
+            background:var(--oo-own-bg, #e7fbe1); color:var(--oo-own-fg, #0f172a);
+            border:1px solid var(--oo-own-border, rgba(10,124,74,.10));
+            border-bottom-right-radius:5px;
+        }
+
         .chat-messages .msg-other > .msg-bubble,
         .chat-messages .msg-private > .msg-bubble {
             background:#fff; color:var(--text-main);
-            border:1px solid rgba(0,0,0,.04);
-            border-bottom-left-radius:6px;
+            border:1px solid rgba(15,23,42,.05);
+            border-bottom-left-radius:5px;
         }
+        /* Emoji'ler satır satır kırılmasın, aynı satırda kalsın */
+        .chat-messages .msg-bubble .msg-text {
+            white-space:pre-wrap; overflow-wrap:break-word; word-break:normal;
+        }
+        .chat-messages .msg-bubble img.emoji {
+            display:inline-block !important; width:1.15em; height:1.15em;
+            vertical-align:-.18em; margin:0 .04em;
+        }
+        .chat-messages .msg-bubble .msg-text.emoji-only {
+            font-size:1.9rem; line-height:1.15; letter-spacing:.04em;
+        }
+        .chat-messages .msg-bubble .msg-text.emoji-only img.emoji { width:1.05em; height:1.05em; }
+        /* Medya balonları */
+        .chat-messages .msg-bubble.has-media { padding:4px 4px 3px; }
+        .chat-messages .msg-media-img,
+        .chat-messages .msg-media-video {
+            display:block; width:100%; max-width:260px; max-height:320px;
+            object-fit:cover; border-radius:11px; background:#0002;
+        }
+        .chat-messages .msg-media-audio { display:none; }
+        /* ===== Şık sesli mesaj oynatıcısı ===== */
+        .chat-messages .oo-voice {
+            display:flex; align-items:center; gap:10px; padding:6px 8px 6px 6px;
+            min-width:186px; max-width:250px;
+        }
+        .chat-messages .oo-voice .ov-play {
+            flex:none; width:34px; height:34px; border-radius:50%; border:none; cursor:pointer;
+            display:flex; align-items:center; justify-content:center; font-size:.82rem;
+            background:rgba(255,255,255,.22); color:inherit; transition:transform .12s, background .15s;
+        }
+        .chat-messages .msg-other .oo-voice .ov-play,
+        .chat-messages .msg-private .oo-voice .ov-play { background:var(--primary-green); color:#fff; }
+        .chat-messages .oo-voice .ov-play:active { transform:scale(.92); }
+        .chat-messages .oo-voice .ov-mid { flex:1; min-width:0; display:flex; flex-direction:column; gap:4px; }
+        .chat-messages .oo-voice .ov-wave { display:flex; align-items:center; gap:2px; height:20px; }
+        .chat-messages .oo-voice .ov-wave i {
+            display:block; width:2px; border-radius:2px; background:currentColor; opacity:.35;
+            transition:opacity .18s, transform .18s;
+        }
+        .chat-messages .oo-voice.playing .ov-wave i { animation:ovBar .9s ease-in-out infinite; opacity:.75; }
+        .chat-messages .oo-voice.playing .ov-wave i:nth-child(3n) { animation-delay:.15s }
+        .chat-messages .oo-voice.playing .ov-wave i:nth-child(3n+1) { animation-delay:.3s }
+        @keyframes ovBar { 0%,100%{ transform:scaleY(.55) } 50%{ transform:scaleY(1.25) } }
+        .chat-messages .oo-voice .ov-dur { font-size:.63rem; opacity:.6; letter-spacing:.02em; }
+        /* Gönderiliyor durumu: yumuşak parıltı */
+        .chat-messages .oo-voice.sending .ov-wave i { opacity:.28; }
+        .chat-messages .oo-voice.sending .ov-mid::after {
+            content:''; height:2px; border-radius:2px; background:currentColor; opacity:.25;
+            animation:ovLoad 1.1s ease-in-out infinite;
+        }
+        @keyframes ovLoad { 0%{ width:12%; opacity:.18 } 50%{ width:86%; opacity:.4 } 100%{ width:12%; opacity:.18 } }
+        .chat-messages .msg-media-file {
+            display:block; padding:8px 10px; font-size:.85rem;
+            color:var(--primary-green); text-decoration:none; font-weight:600;
+        }
+        .chat-messages .msg-bubble.has-media .msg-meta { padding:2px 6px 1px; }
         .chat-messages .msg-bubble .msg-meta {
             display:flex; align-items:center; gap:6px; justify-content:flex-end;
         }
@@ -749,9 +837,20 @@
         #screen-sohbetler .conv-preview svg { max-height:1em; vertical-align:-0.15em; }
         #screen-sohbetler .conv-avatar span { font-size:1.05rem !important; line-height:1; }
         .chat-h-avatar span { font-size:.95rem !important; line-height:1; }
-        .chat-messages .msg-bubble .tick { font-size:.7rem; }
-        .chat-messages .msg-bubble .tick.blue { color:#34b7f1; }
-        .chat-messages .msg-own > .msg-bubble .tick.gray { color:rgba(255,255,255,.75); }
+        /* Tek tik sistemi: gri = gönderildi, yeşil = iletildi, mavi = okundu */
+        .chat-messages .msg-bubble .tick { font-size:.72rem; line-height:1; }
+        .chat-messages .msg-bubble .tick.gray  { color:#9ca3af; }
+        .chat-messages .msg-bubble .tick.green { color:#16a34a; }
+        .chat-messages .msg-bubble .tick.blue  { color:#2f8ff5; }
+        .chat-messages .msg-bubble .msg-time { font-size:.63rem; opacity:.55; }
+        .chat-messages .msg-deleted > .msg-bubble { background:#f3f4f6 !important; border-color:rgba(15,23,42,.05) !important; }
+        /* Gece arka planında karşı taraf baloncukları okunur kalsın */
+        body.oo-chat-dark .chat-messages .msg-other > .msg-bubble,
+        body.oo-chat-dark .chat-messages .msg-private > .msg-bubble {
+            background:#1f2937; color:#e5e7eb; border-color:rgba(255,255,255,.07);
+        }
+        body.oo-chat-dark .chat-messages .msg-bubble .msg-time { opacity:.7; }
+        .chat-messages .msg-deleted .msg-deleted-text { color:#6b7280; font-style:italic; }
 
         /* ===== ARAMA EKRANI (Adım 4) ===== */
         #screen-ooCall, #screen-ooIncoming {
@@ -1383,14 +1482,14 @@
                 </div>
                 <button class="chat-hbtn" onclick="chatVideo()" title="Görüntülü arama" aria-label="Görüntülü arama"><i class="fa-solid fa-video"></i></button>
                 <button class="chat-hbtn" onclick="chatCall()" title="Sesli arama" aria-label="Sesli arama"><i class="fa-solid fa-phone"></i></button>
-                <button class="chat-hbtn" onclick="chatMore()" title="Daha fazla" aria-label="Daha fazla"><i class="fa-solid fa-ellipsis-vertical"></i></button>
+                <button class="chat-hbtn" onclick="chatMore()" title="Sohbet ayarları" aria-label="Sohbet ayarları"><i class="fa-solid fa-ellipsis-vertical"></i></button>
                 <button class="chat-hbtn" onclick="chatNext()" title="Sonraki kişi" aria-label="Sonraki kişi"><i class="fa-solid fa-chevron-right"></i></button>
             </div>
             <div class="chat-messages" id="chatMessages"></div>
             <div class="chat-input-bar">
                 <div class="ci-field">
                     <button type="button" class="ci-inner-btn ci-plus" id="ciPlusBtn" onclick="chatToggleAttach()" aria-label="Ekle"><i class="fa-solid fa-plus"></i></button>
-                    <input id="chatInput" type="text" placeholder="Bir mesaj yaz..." oninput="updateSendIcon()" onkeydown="if(event.key==='Enter')sendChatMsg()" onfocus="ciClosePanels()">
+                    <textarea id="chatInput" rows="1" placeholder="Bir mesaj yaz..." oninput="updateSendIcon();ciAutoGrow(this)" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChatMsg()}" onfocus="ciClosePanels()"></textarea>
                     <button type="button" class="ci-inner-btn ci-emoji" id="ciEmojiBtn" onclick="chatToggleEmoji()" aria-label="Emoji"><i class="fa-regular fa-face-smile"></i></button>
                     <button type="button" class="ci-inner-btn ci-cam" onclick="chatCamera()" aria-label="Kamera"><i class="fa-solid fa-camera"></i></button>
                 </div>
@@ -1781,7 +1880,149 @@
         style="width:100%;height:100%;border:0;display:block;"
         allow="camera; microphone; clipboard-write; clipboard-read; autoplay"></iframe>
     </div>
+
+    <!-- ===== Sohbet Ayarları modalı (baloncuk rengi + arka plan teması) ===== -->
+    <style>
+      #csModal { position:absolute; inset:0; z-index:120; display:flex; align-items:flex-end; justify-content:center;
+        background:rgba(15,23,42,.42); backdrop-filter:blur(2px); }
+      #csModal.hidden { display:none; }
+      #csModal .cs-sheet { width:100%; max-width:520px; background:var(--bg-white,#fff);
+        border-radius:20px 20px 0 0; padding:14px 16px calc(18px + env(safe-area-inset-bottom));
+        box-shadow:0 -8px 30px rgba(15,23,42,.18); animation:csUp .2s ease; max-height:82%; overflow-y:auto; }
+      @keyframes csUp { from{ transform:translateY(16px); opacity:0 } to{ transform:translateY(0); opacity:1 } }
+      #csModal .cs-title { font-weight:700; font-size:1rem; color:var(--text-main,#0f172a); }
+      #csModal .cs-sub { font-size:.74rem; color:var(--text-secondary,#64748b); margin-top:2px; }
+      #csModal .cs-label { font-size:.78rem; font-weight:600; color:var(--text-secondary,#64748b);
+        margin:14px 0 8px; text-transform:uppercase; letter-spacing:.04em; }
+      #csModal .cs-row { display:flex; gap:10px; flex-wrap:wrap; }
+      #csModal .cs-chip { border:2px solid rgba(15,23,42,.08); background:#fff; border-radius:14px;
+        padding:8px 10px; display:flex; align-items:center; gap:8px; cursor:pointer; font-size:.8rem;
+        color:var(--text-main,#0f172a); transition:border-color .15s, transform .12s; }
+      #csModal .cs-chip:active { transform:scale(.97); }
+      #csModal .cs-chip.sel { border-color:var(--primary-green,#16a34a); }
+      #csModal .cs-dot { width:22px; height:22px; border-radius:7px; border:1px solid rgba(15,23,42,.08); }
+      #csModal .cs-bg { width:74px; height:52px; border-radius:12px; border:2px solid rgba(15,23,42,.08);
+        cursor:pointer; position:relative; overflow:hidden; }
+      #csModal .cs-bg.sel { border-color:var(--primary-green,#16a34a); }
+      #csModal .cs-bg span { position:absolute; left:0; right:0; bottom:0; font-size:.6rem; text-align:center;
+        background:rgba(255,255,255,.78); color:#0f172a; padding:1px 0; }
+      #csModal .cs-close { margin-top:16px; width:100%; padding:11px; border:none; border-radius:14px;
+        background:var(--primary-green,#16a34a); color:#fff; font-weight:600; font-size:.9rem; cursor:pointer; }
+    </style>
+    <div id="csModal" class="hidden" onclick="if(event.target===this)csCloseSettings()">
+      <div class="cs-sheet">
+        <div class="cs-title">Sohbet ayarları</div>
+        <div class="cs-sub">Baloncuk rengi ve arka plan temasını seç</div>
+        <div class="cs-label">Baloncuk rengi</div>
+        <div class="cs-row" id="csBubbleRow"></div>
+        <div class="cs-label">Arka plan teması</div>
+        <div class="cs-row" id="csBgRow"></div>
+        <button class="cs-close" onclick="csCloseSettings()">Tamam</button>
+      </div>
+    </div>
     <script>
+    (function(){
+      'use strict';
+      var BUBBLES = [
+        { id:'sohbeto', label:'Sohbeto yeşili', bg:'#0a7c4a', fg:'#ffffff', bd:'rgba(0,0,0,.06)' },
+        { id:'klasik',  label:'Klasik yeşil',   bg:'#e7fbe1', fg:'#0f172a', bd:'rgba(10,124,74,.10)' },
+        { id:'gece',    label:'Gece mavisi',    bg:'#1e293b', fg:'#f8fafc', bd:'rgba(255,255,255,.08)' },
+        { id:'lila',    label:'Lila',           bg:'#ece5ff', fg:'#2b2154', bd:'rgba(84,60,160,.12)' },
+        { id:'kum',     label:'Kum',            bg:'#fdf1dc', fg:'#3b2f1c', bd:'rgba(120,90,40,.12)' }
+      ];
+      var BGS = [
+        { id:'varsayilan', label:'Varsayılan', css:'linear-gradient(180deg,#ffffff 0%,#eafaf0 280%)' },
+        { id:'doga',       label:'Doğa',       css:'linear-gradient(180deg,#eef8ec 0%,#d7ecd8 100%)' },
+        { id:'gunbatimi',  label:'Gün batımı', css:'linear-gradient(180deg,#fff3e6 0%,#ffe0e6 100%)' },
+        { id:'gece',       label:'Gece',       css:'linear-gradient(180deg,#101827 0%,#1b2437 100%)' }
+      ];
+      var KEY = 'sohbeto-chat-look';
+      function load(){
+        try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch(e){ return {}; }
+      }
+      function save(v){ try { localStorage.setItem(KEY, JSON.stringify(v)); } catch(e){} }
+      function apply(){
+        var s = load();
+        var b = BUBBLES.filter(function(x){ return x.id === s.bubble; })[0] || BUBBLES[0];
+        var g = BGS.filter(function(x){ return x.id === s.bg; })[0] || BGS[0];
+        var r = document.documentElement.style;
+        r.setProperty('--oo-own-bg', b.bg);
+        r.setProperty('--oo-own-fg', b.fg);
+        r.setProperty('--oo-own-border', b.bd);
+        r.setProperty('--oo-chat-bg', g.css);
+        document.body.classList.toggle('oo-chat-dark', g.id === 'gece');
+      }
+      function build(){
+        var s = load();
+        var br = document.getElementById('csBubbleRow');
+        var gr = document.getElementById('csBgRow');
+        if (!br || !gr) return;
+        br.innerHTML = ''; gr.innerHTML = '';
+        BUBBLES.forEach(function(b){
+          var el = document.createElement('div');
+          el.className = 'cs-chip' + ((s.bubble || 'sohbeto') === b.id ? ' sel' : '');
+          el.innerHTML = '<span class="cs-dot" style="background:' + b.bg + '"></span>' + b.label;
+          el.onclick = function(){ var v = load(); v.bubble = b.id; save(v); apply(); build(); };
+          br.appendChild(el);
+        });
+        BGS.forEach(function(g){
+          var el = document.createElement('div');
+          el.className = 'cs-bg' + ((s.bg || 'varsayilan') === g.id ? ' sel' : '');
+          el.style.background = g.css;
+          el.innerHTML = '<span>' + g.label + '</span>';
+          el.onclick = function(){ var v = load(); v.bg = g.id; save(v); apply(); build(); };
+          gr.appendChild(el);
+        });
+      }
+      window.chatOpenSettings = function(){
+        build();
+        var m = document.getElementById('csModal');
+        if (m) m.classList.remove('hidden');
+        try { if (window.ciClosePanels) window.ciClosePanels(); } catch(e){}
+      };
+      window.csCloseSettings = function(){
+        var m = document.getElementById('csModal');
+        if (m) m.classList.add('hidden');
+      };
+      window.chatMore = window.chatOpenSettings;
+      /* Mesaj kutusu yukarı doğru büyür (yatay kaydırma yok) */
+      window.ciAutoGrow = function(el){
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = Math.min(el.scrollHeight, 132) + 'px';
+      };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply);
+      else apply();
+    })();
+    </script>
+
+    <script>
+    /* Klavye (visualViewport) uyumu: uygulama yüksekliğini görünür alana sabitler.
+       Böylece sohbet başlığı (kişi adı) en üstte kalır, yalnız mesajlar kayar. */
+    (function(){
+      'use strict';
+      var vv = window.visualViewport;
+      function applyH(){
+        var h = vv ? vv.height : window.innerHeight;
+        document.documentElement.style.setProperty('--app-h', h + 'px');
+        var box = document.getElementById('chatMessages');
+        if (box && document.getElementById('screen-chat') &&
+            !document.getElementById('screen-chat').classList.contains('hidden-screen')) {
+          box.scrollTop = box.scrollHeight;
+        }
+      }
+      applyH();
+      if (vv) { vv.addEventListener('resize', applyH); vv.addEventListener('scroll', applyH); }
+      window.addEventListener('resize', applyH);
+      window.addEventListener('orientationchange', function(){ setTimeout(applyH, 250); });
+      document.addEventListener('focusin', function(e){
+        if (e.target && e.target.id === 'chatInput') setTimeout(applyH, 120);
+      });
+      document.addEventListener('focusout', function(){ setTimeout(applyH, 120); });
+    })();
+    </script>
+    <script>
+
     (function(){
       'use strict';
       function showA2(){

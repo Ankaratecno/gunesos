@@ -192,7 +192,8 @@ async function dbSaveMessage(chatId, msgData) {
     try {
         const db = await openDB();
         const msgHash = await sha256(chatId + '::' + msgData.text + '::' + msgData.ts + '::' + (msgData.msgId||''));
-        const record = { chatId, hash: msgHash, ts: msgData.ts, sender: msgData.sender, text: msgData.text, isOwn: msgData.isOwn, isP2P: msgData.isP2P, isPrivate: msgData.isPrivate, msgId: msgData.msgId || null, status: msgData.status || 'sent' };
+        const record = { chatId, hash: msgHash, ts: msgData.ts, sender: msgData.sender, text: msgData.text, isOwn: msgData.isOwn, isP2P: msgData.isP2P, isPrivate: msgData.isPrivate, msgId: msgData.msgId || null, status: msgData.status || 'sent',
+            kind: msgData.kind || 'text', media: msgData.media || null, mime: msgData.mime || null, dur: msgData.dur || 0, fileName: msgData.fileName || null };
         return new Promise(r => {
             const tx = db.transaction("messages", "readwrite");
             tx.objectStore("messages").add(record);
@@ -262,6 +263,23 @@ async function dbDeleteMessageByMsgId(msgId) {
         });
     } catch (e) { return; }
 }
+async function dbUpdateMessageStatus(msgId, status) {
+    if (!msgId) return;
+    try {
+        const db = await openDB();
+        return new Promise(r => {
+            const tx = db.transaction("messages", "readwrite");
+            const req = tx.objectStore("messages").openCursor();
+            req.onsuccess = (e) => {
+                const c = e.target.result; if (!c) return;
+                if (c.value && c.value.msgId === msgId) { const v = c.value; v.status = status; try { c.update(v); } catch (err) {} }
+                c.continue();
+            };
+            tx.oncomplete = () => r();
+            tx.onerror = () => r();
+        });
+    } catch (e) { return; }
+}
 async function dbMarkMessageDeleted(msgId) {
     if (!msgId) return;
     try {
@@ -311,7 +329,13 @@ function getContactByNumber(num) { return contactsState.byNumber.get(normalizeNu
 async function loadContactsToState() {
     const list = await dbLoadContacts();
     contactsState.byNumber.clear();
-    list.forEach(c => contactsState.byNumber.set(c.number, c));
+    list.forEach(c => {
+        // Eski kayıtlar normalize edilmemiş olabilir ("0555...") → tek biçime çevir.
+        const n = normalizeNumber(c.number);
+        if (!n || n === '+') return;
+        if (n !== c.number) { c.number = n; try { dbSaveContact(c); } catch (e) {} }
+        contactsState.byNumber.set(n, c);
+    });
 }
 async function loadIdentity() {
     const no = await dbGet("virtualNo"), seed = await dbGet("seed"), nick = await dbGet("nick"),
@@ -921,6 +945,7 @@ async function handleP2PMsg(senderConnId, data) {
     }
     else if (data.startsWith("CALL_")) { handleCallSignal(senderConnId, data, true); }
     else if (data.startsWith("VOICE_PART###") || data.startsWith("VOICE_END###")) { handleVoicePacket(senderConnId, data); }
+    else if (data.startsWith("MEDIA_PART###") || data.startsWith("MEDIA_END###")) { handleMediaPacket(senderConnId, data); }
     else { renderIncomingMsg(senderConnId, CONFIG.connectionId, data, true, null); }
 }
 
@@ -1029,8 +1054,16 @@ function sendSignaling(targetConnId, type, data) { wsSend(`[P2P_${type}]${btoa(e
 // WSS (chatHost/countHost) tamamen kaldırıldı. Kimlik artık sanal numaradan
 // türetilen sabit bir PeerJS ID'sidir: sohbeto-<numara>.
 function peerIdForNumber(num) {
-    const d = String(num || '').replace(/[^0-9]/g, '');
+    // Numara formatı ne olursa olsun ("0555...", "+90555...", "90555...")
+    // aynı peer ID üretilmeli. Aksi halde iki taraf birbirini bulamıyor ve
+    // yanlış eşleşmeler (mesaj çakışması) oluşuyor.
+    const d = normalizeNumber(num).replace(/[^0-9]/g, '');
     return d ? 'sohbeto-' + d : '';
+}
+// connId → normalize numara (sohbeto-905551234567 → +905551234567)
+function numberFromPeerId(connId) {
+    const m = /^sohbeto-(\d+)$/.exec(String(connId || ''));
+    return m ? normalizeNumber('+' + m[1]) : '';
 }
 
 // Eski `connectCountServer` sadece connectionId üretiyordu; artık numaradan türetiliyor.
@@ -1109,6 +1142,7 @@ async function handleTransportMessage(sConnId, sVirtualNo, tConnId, text) {
         }
         if (text.startsWith("CALL_")) { handleCallSignal(sConnId, text, true); return; }
         if (text.startsWith("VOICE_PART###") || text.startsWith("VOICE_END###")) { handleVoicePacket(sConnId, text); return; }
+        if (text.startsWith("MEDIA_PART###") || text.startsWith("MEDIA_END###")) { handleMediaPacket(sConnId, text); return; }
         if (text.startsWith("MSG_ACK###")) { const parts = text.split("###"); handleAck(parts[1], parts[2]); return; }
         if (text.startsWith("MSG_DEL###")) { handleRemoteDelete(sConnId, text.split("###")[1]); return; }
         if (text.startsWith("TYPING###")) { handleTypingSignal(sConnId, text.split("###")[1] === '1'); return; }
@@ -1171,13 +1205,24 @@ function appendMsgToDOM(div) {
     container.scrollTop = container.scrollHeight;
 }
 
+// Tek tik sistemi: gri = gönderildi, yeşil = iletildi, mavi = okundu.
+function tickHtmlFor(status) {
+    const cls = status === 'read' ? 'blue' : (status === 'delivered' ? 'green' : 'gray');
+    return `<span class="tick ${cls}" data-tick="${status || 'sent'}">✓</span>`;
+}
+// Sadece emoji içeren mesajlar balonsuz/büyük gösterilir, satır satır kırılmaz.
+const _EMOJI_ONLY_RE = /^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|\uFE0F|\u200D|\s)+$/u;
+function emojiOnlyClass(text) {
+    const t = String(text || '').trim();
+    if (!t) return '';
+    try { return _EMOJI_ONLY_RE.test(t) ? ' emoji-only' : ''; } catch (e) { return ''; }
+}
+
 function buildOwnMsgEl(text, msgId, isP2P, timeStr, status) {
     const div = document.createElement('div'); div.className = 'msg msg-own'; div.dataset.msgId = msgId || '';
     const tag = isP2P ? '<span class="msg-tag tag-p2p">P2P</span>' : '<span class="msg-tag tag-wss">WSS</span>';
-    let tickHtml = '<span class="tick gray" data-tick="sent">✓</span>';
-    if (status === 'delivered') tickHtml = '<span class="tick gray" data-tick="sent">✓</span>';
-    else if (status === 'read') tickHtml = '<span class="tick blue" data-tick="sent">✓</span>';
-    div.innerHTML = `<div class="msg-bubble"><div class="msg-meta" style="justify-content:flex-start;margin-bottom:2px"><span style="font-size:10px;opacity:.5">SEN${tag}</span></div><div>${escapeHtml(text)}</div><div class="msg-meta"><span class="msg-time">${timeStr}</span>${tickHtml}</div></div>`;
+    let tickHtml = tickHtmlFor(status);
+    div.innerHTML = `<div class="msg-bubble"><div class="msg-meta" style="justify-content:flex-start;margin-bottom:2px"><span style="font-size:10px;opacity:.5">SEN${tag}</span></div><div class="msg-text${emojiOnlyClass(text)}">${escapeHtml(text)}</div><div class="msg-meta"><span class="msg-time">${timeStr}</span>${tickHtml}</div></div>`;
     return div;
 }
 
@@ -1185,7 +1230,7 @@ function buildIncomingMsgEl(displaySender, text, isP2P, isPrivate, timeStr, msgI
     const div = document.createElement('div'); div.className = `msg ${isPrivate ? 'msg-private' : 'msg-other'}`;
     if (msgId) div.dataset.msgId = msgId;
     let tag = isP2P ? '<span class="msg-tag tag-p2p">P2P</span>' : (isPrivate ? '<span class="msg-tag tag-priv">ÖZEL</span>' : '<span class="msg-tag tag-wss">WSS</span>');
-    div.innerHTML = `<div class="msg-bubble"><div class="msg-sender">${escapeHtml(displaySender)} ${tag}</div><div>${escapeHtml(text)}</div><div class="msg-meta"><span class="msg-time">${timeStr}</span></div></div>`;
+    div.innerHTML = `<div class="msg-bubble"><div class="msg-sender">${escapeHtml(displaySender)} ${tag}</div><div class="msg-text${emojiOnlyClass(text)}">${escapeHtml(text)}</div><div class="msg-meta"><span class="msg-time">${timeStr}</span></div></div>`;
     return div;
 }
 
@@ -1207,7 +1252,17 @@ function renderOwnMsg(targetConnId, text, msgId, isP2P) {
     updateConversation(targetConnId, text, true, isPrivate);
 }
 
+const _seenIncoming = new Map(); // msgId -> ts (mükerrer mesaj koruması)
 function renderIncomingMsg(senderConnId, targetConnId, text, isP2P, msgId) {
+    if (msgId) {
+        const key = senderConnId + '|' + msgId;
+        const now0 = Date.now();
+        if (_seenIncoming.has(key)) return;               // aynı mesaj iki kanaldan geldi → yoksay
+        _seenIncoming.set(key, now0);
+        if (_seenIncoming.size > 500) {
+            _seenIncoming.forEach((ts, k) => { if (now0 - ts > 600000) _seenIncoming.delete(k); });
+        }
+    }
     const isPrivate = (targetConnId !== "HERKES");
     const chatId = getChatIdForMsg(targetConnId, senderConnId, false);
     const ts = Date.now();
@@ -1271,7 +1326,7 @@ function renderConvList() {
         if (avEl) avEl.addEventListener('click', (ev) => { ev.stopPropagation(); showContactCard(connId); });
         d.onclick = () => openChat(connId); ozelList.appendChild(d);
     });
-    if (ozelCount === 0) ozelList.innerHTML = '<div class="conv-empty">Henüz özel sohbet yok<br>Kişilerden birini seçerek başlayın</div>';
+    if (ozelCount === 0) ozelList.innerHTML = '';
 }
 
 function getAvatarColor(name) { let hash = 0; for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash); return 'avatar-c' + (Math.abs(hash) % 8); }
@@ -1309,14 +1364,19 @@ async function openChat(id) {
     container.innerHTML = '';
     const msgs = await dbLoadMessages(id, 200);
     if (msgs.length === 0) {
-        container.innerHTML = '<div style="text-align:center;padding:40px 20px;color:#5a6a7e;font-size:12px;line-height:1.5">💬 Henüz mesaj yok<br><span style="font-size:10px">İlk mesajı siz gönderin</span></div>';
+        // Boş sohbette placeholder/baloncuk gösterilmez — sohbet tamamen temiz açılır.
+        container.innerHTML = '';
     } else {
         const frag = document.createDocumentFragment();
         msgs.forEach(m => {
             const d = new Date(m.ts);
             const timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
             let el;
-            if (m.isOwn) {
+            const kind = m.kind || 'text';
+            if (kind !== 'text' && !m.deleted) {
+                el = buildMediaMsgEl({ kind, dataUrl: m.media, mime: m.mime, fileName: m.fileName, isOwn: !!m.isOwn, displaySender: m.sender || '', timeStr, msgId: m.msgId, status: m.status || 'sent', dur: m.dur || 0 });
+                if (m.isOwn && m.msgId) state.sentMsgs.set(m.msgId, { el, status: m.status || 'sent', chatId: id });
+            } else if (m.isOwn) {
                 el = buildOwnMsgEl(m.text, m.msgId, m.isP2P, timeStr, m.status || 'sent');
                 if (m.msgId) {
                     const existing = state.sentMsgs.get(m.msgId);
@@ -1413,7 +1473,7 @@ function markMsgElDeleted(el) {
     const timeHtml = meta ? meta.outerHTML : '';
     const sender = bubble.querySelector('.msg-sender');
     bubble.innerHTML = (sender ? sender.outerHTML : '') +
-        `<div class="msg-deleted-text">🚫 ${DELETED_MSG_TEXT}</div>` + timeHtml;
+        `<div class="msg-deleted-text">${DELETED_MSG_TEXT}</div>` + timeHtml;
 }
 
 function findMsgElById(msgId) {
@@ -1426,7 +1486,7 @@ async function handleRemoteDelete(senderConnId, msgId) {
     if (!msgId) return;
     await dbMarkMessageDeleted(msgId);
     markMsgElDeleted(findMsgElById(msgId));
-    log(`[SİL] Karşı taraf bir mesajı sildi`, '#f59e0b');
+    log(DELETED_MSG_TEXT, '#9ca3af');
 }
 
 /** Sadece bu cihazdan siler. */
@@ -1478,7 +1538,7 @@ function openMsgActionSheet(msgEl) {
         <div class="msg-action-title">Mesaj</div>
         <button type="button" data-act="copy">📋 Kopyala</button>
         <button type="button" data-act="local">🗑️ Bende sil</button>
-        ${isOwn ? '<button type="button" data-act="all" class="danger">🚫 Herkesten sil</button>' : ''}
+        ${isOwn ? '<button type="button" data-act="all">🗑️ Herkesten sil</button>' : ''}
         <button type="button" data-act="cancel" class="cancel">Vazgeç</button>
       </div>`;
     document.body.appendChild(wrap);
@@ -1604,8 +1664,8 @@ function getTypingIndicatorEl() {
         el.id = 'typingIndicator';
         el.innerHTML = '<div class="tdots"><i></i><i></i><i></i></div>';
         box.appendChild(el);
-    } else if (el.parentNode !== box) {
-        box.appendChild(el);
+    } else if (el.parentNode !== box || el.nextSibling) {
+        box.appendChild(el);   // her zaman listenin en sonunda kalsın
     }
     return el;
 }
@@ -1701,7 +1761,13 @@ window.renderTypingUI = renderTypingUI;
 
 async function sendCurrentMessage() {
     const inp = document.getElementById('chatInput'); const text = inp.value.trim(); if (!text) return;
-    const msgId = newMsgId(); const target = state.target;
+    // Hedef DAİMA açık olan sohbetten türetilir. state.target LOOKUP cevapları
+    // veya arama sinyalleriyle değişebiliyordu; bu yüzden mesaj başka kişiye
+    // gidebiliyordu. Artık aktif sohbet tek doğru kaynak.
+    const activeId = (state.chatMode === 'chat' && state.activeChat) ? state.activeChat : null;
+    const target = activeId ? (activeId === 'genel' ? 'HERKES' : activeId) : state.target;
+    state.target = target;
+    const msgId = newMsgId();
     const peer = peers[target];
     if (target !== "HERKES") {
         // Özel mesajlar WSS'ye asla düşmez: P2P açıksa hemen gönder, değilse P2P kurulunca gönder.
@@ -1741,8 +1807,8 @@ async function flushOutboundQueue() {
 function handleAck(msgId, status) {
     const entry = state.sentMsgs.get(msgId); if (!entry) return;
     const tickEl = entry.el.querySelector('[data-tick]'); if (!tickEl) return;
-    if (status === 'DELIVERED' && entry.status !== 'read') { tickEl.innerHTML = '✓'; tickEl.className = 'tick gray'; entry.status = 'delivered'; if (state.outboundQueue.has(msgId)) { state.outboundQueue.delete(msgId); saveOutbox(); } }
-    else if (status === 'READ') { tickEl.innerHTML = '✓'; tickEl.className = 'tick blue'; entry.status = 'read'; if (state.outboundQueue.has(msgId)) { state.outboundQueue.delete(msgId); saveOutbox(); } }
+    if (status === 'DELIVERED' && entry.status !== 'read') { tickEl.innerHTML = '✓'; tickEl.className = 'tick green'; tickEl.dataset.tick = 'delivered'; entry.status = 'delivered'; dbUpdateMessageStatus(msgId, 'delivered'); if (state.outboundQueue.has(msgId)) { state.outboundQueue.delete(msgId); saveOutbox(); } }
+    else if (status === 'READ') { tickEl.innerHTML = '✓'; tickEl.className = 'tick blue'; tickEl.dataset.tick = 'read'; entry.status = 'read'; dbUpdateMessageStatus(msgId, 'read'); if (state.outboundQueue.has(msgId)) { state.outboundQueue.delete(msgId); saveOutbox(); } }
 }
 
 // ==================== UI NAVIGATION ====================
@@ -1859,16 +1925,23 @@ function updateContactList(filter) {
 
 // Numara üzerinden kişiyi aç: connId bilinmiyorsa LOOKUP gönder, P2P kur, sohbeti aç
 async function openContactByNumber(number) {
-    const c = getContactByNumber(number); if (!c) return;
-    if (c.connId) {
-        if (!state.users.has(c.connId)) state.users.set(c.connId, `${c.name || c.number} [${c.number}]`);
-        switchView('sohbetler'); openChat(c.connId); return;
+    const num = normalizeNumber(number);
+    const c = getContactByNumber(num); if (!c) return;
+    // Peer ID numaradan deterministik türetilir → LOOKUP yarışına gerek yok.
+    const derived = peerIdForNumber(c.number);
+    const connId = c.connId && numberFromPeerId(c.connId) === c.number ? c.connId : derived;
+    if (connId) {
+        if (c.connId !== connId) { c.connId = connId; contactsState.byNumber.set(c.number, c); dbSaveContact(c); }
+        if (!state.users.has(connId)) state.users.set(connId, `${c.name || c.number} [${c.number}]`);
+        try { SohbetoPeer && SohbetoPeer.connectTo(connId); } catch (e) {}
+        switchView('sohbetler'); openChat(connId);
+        // Yine de LOOKUP at: karşı taraf çevrimiçi mi bilgisi için (sohbeti değiştirmez)
+        try { wsSend(`LOOKUP###${c.number}`, "HERKES"); } catch (e) {}
+        return;
     }
-    // Henüz connId yok ya da peer offline → LOOKUP yayımla
     log(`[LOOKUP] ${c.number} aranıyor...`, '#fbbf24');
     wsSend(`LOOKUP###${c.number}`, "HERKES");
     showNotif(`🔎 ${escapeHtml(c.name)} (${escapeHtml(c.number)}) çevrimiçi mi diye bakıyoruz...`, 4000);
-    // 5 sn içinde reply gelirse handleLookupReply otomatik açar
     if (!window._pendingLookups) window._pendingLookups = new Map();
     window._pendingLookups.set(c.number, { ts: Date.now(), name: c.name });
     setTimeout(() => {
@@ -1880,15 +1953,24 @@ async function openContactByNumber(number) {
 }
 
 function handleLookupReply(number, connId) {
-    const c = getContactByNumber(number); if (!c) return;
+    const num = normalizeNumber(number);
+    const c = getContactByNumber(num); if (!c) return;
+    // Kimlik doğrulama: connId numaradan türetilebiliyorsa cevabın gerçekten
+    // o numaraya ait olduğunu doğrula. Aksi halde başka bir peer kendini
+    // bu numara gibi tanıtıp sohbetleri karıştırabilir.
+    const fromId = numberFromPeerId(connId);
+    if (fromId && fromId !== c.number) { log(`[LOOKUP ✗] ${num} için uyumsuz kimlik`, '#ef4444'); return; }
     c.connId = connId; c.lastSeen = Date.now();
     contactsState.byNumber.set(c.number, c);
     dbSaveContact(c);
     state.users.set(connId, `${c.name} [${c.number}]`);
     log(`[LOOKUP ✓] ${c.number} → ${connId.substring(0,10)}`, '#22c55e');
-    if (window._pendingLookups?.has(number)) {
-        window._pendingLookups.delete(number);
-        switchView('sohbetler'); openChat(connId);
+    if (window._pendingLookups?.has(c.number)) {
+        window._pendingLookups.delete(c.number);
+        // Sadece bekleyen sohbet zaten açık değilse aç (aktif sohbeti değiştirme)
+        if (!(state.chatMode === 'chat' && state.activeChat && state.activeChat !== connId)) {
+            switchView('sohbetler'); openChat(connId);
+        }
     }
     updateContactList();
 }
@@ -1967,22 +2049,73 @@ function cardSendGroupInvite(){
 const _voiceRx = new Map(); // vid -> { parts:[], total, mime, dur, count }
 const VOICE_CHUNK = 8000;   // base64 karakter cinsinden ~6 KB parça
 
-function buildVoiceMsgEl(displaySender, blobUrl, durSec, isOwn, isP2P, timeStr, msgId) {
+// Şık sesli mesaj oynatıcısı (native <audio controls> yerine)
+function voiceDurText(sec) {
+    const s = Math.max(0, Math.round(sec || 0));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+function voicePlayerHtml(src, durSec, sending) {
+    const bars = [];
+    for (let i = 0; i < 26; i++) {
+        const h = 5 + ((i * 7 + (i % 5) * 11) % 14);
+        bars.push(`<i style="height:${h}px"></i>`);
+    }
+    const audio = src ? `<audio class="msg-media-audio" preload="metadata" src="${src}"></audio>` : '';
+    const icon = sending ? '<i class="fa-solid fa-arrow-up"></i>' : '<i class="fa-solid fa-play"></i>';
+    return `<div class="oo-voice${sending ? ' sending' : ''}" onclick="ooVoiceToggle(this)">
+        <button type="button" class="ov-play" aria-label="Oynat">${icon}</button>
+        <div class="ov-mid"><div class="ov-wave">${bars.join('')}</div></div>
+        <span class="ov-dur">${sending ? 'gönderiliyor…' : voiceDurText(durSec)}</span>
+        ${audio}
+    </div>`;
+}
+window.ooVoiceToggle = function (root) {
+    if (!root || root.classList.contains('sending')) return;
+    const audio = root.querySelector('audio');
+    if (!audio) return;
+    const btn = root.querySelector('.ov-play');
+    if (audio.paused) {
+        document.querySelectorAll('.chat-messages .oo-voice.playing').forEach(el => {
+            const a = el.querySelector('audio'); if (a) { a.pause(); a.currentTime = 0; }
+            el.classList.remove('playing');
+            const b = el.querySelector('.ov-play'); if (b) b.innerHTML = '<i class="fa-solid fa-play"></i>';
+        });
+        audio.play().then(() => {
+            root.classList.add('playing');
+            if (btn) btn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+        }).catch(() => {});
+        audio.onended = () => {
+            root.classList.remove('playing');
+            if (btn) btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+        };
+    } else {
+        audio.pause();
+        root.classList.remove('playing');
+        if (btn) btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+    }
+};
+
+// Gelen medya/ses için teslim + okundu bilgisi gönder (tik gri kalmasın)
+function sendMediaAck(senderConnId, mid) {
+    if (!senderConnId || !mid) return;
+    const put = (pkt) => sendDataChannelText(senderConnId, pkt) || wsSend(pkt, senderConnId);
+    put(`MSG_ACK###${mid}###DELIVERED`);
+    if (state.chatMode === 'chat' && state.activeChat === senderConnId) {
+        setTimeout(() => put(`MSG_ACK###${mid}###READ`), 350);
+    }
+}
+
+function buildVoiceMsgEl(displaySender, blobUrl, durSec, isOwn, isP2P, timeStr, msgId, status) {
     const div = document.createElement('div');
     div.className = 'msg ' + (isOwn ? 'msg-own' : 'msg-other');
     if (msgId) div.dataset.msgId = msgId;
-    const tag = isP2P ? '<span class="msg-tag tag-p2p">P2P</span>' : '<span class="msg-tag tag-wss">WSS</span>';
-    const head = isOwn
-        ? `<div class="msg-meta" style="justify-content:flex-start;margin-bottom:2px"><span style="font-size:10px;opacity:.5">SEN${tag}</span></div>`
-        : `<div class="msg-sender">${escapeHtml(displaySender)} ${tag}</div>`;
-    const body = blobUrl
-        ? `<audio controls preload="metadata" src="${blobUrl}" style="max-width:220px;height:34px;display:block"></audio>`
-        : `<div style="opacity:.6;font-size:12px">🎤 Sesli mesaj (${durSec}s)</div>`;
-    div.innerHTML = `<div class="msg-bubble">${head}${body}<div class="msg-meta"><span class="msg-time">${timeStr} · 🎤 ${durSec}s</span></div></div>`;
+    const tick = isOwn ? tickHtmlFor(status || 'sent') : '';
+    const head = isOwn ? '' : `<div class="msg-sender">${escapeHtml(displaySender)}</div>`;
+    div.innerHTML = `<div class="msg-bubble has-media">${head}${voicePlayerHtml(blobUrl, durSec)}<div class="msg-meta"><span class="msg-time">${timeStr}</span>${tick}</div></div>`;
     return div;
 }
 
-function renderOwnVoice(targetConnId, blobUrl, durSec, msgId) {
+function renderOwnVoice(targetConnId, blobUrl, durSec, msgId, dataUrl, mime) {
     const isPrivate = (targetConnId !== "HERKES");
     const chatId = getChatIdForMsg(targetConnId, null, true);
     const ts = Date.now();
@@ -1992,21 +2125,22 @@ function renderOwnVoice(targetConnId, blobUrl, durSec, msgId) {
     if (shouldRenderInActiveChat(chatId)) appendMsgToDOM(el);
     state.sentMsgs.set(msgId, { el, status: 'sent', chatId });
     const previewText = `🎤 Sesli mesaj (${durSec}s)`;
-    dbSaveMessage(chatId, { text: previewText, ts, sender: 'SEN', isOwn: true, isP2P: true, isPrivate, msgId, status: 'sent' });
+    dbSaveMessage(chatId, { text: previewText, ts, sender: 'SEN', isOwn: true, isP2P: true, isPrivate, msgId, status: 'sent', kind: 'voice', media: dataUrl || null, mime: mime || 'audio/webm', dur: durSec });
     updateConversation(targetConnId, previewText, true, isPrivate);
 }
 
-function renderIncomingVoice(senderConnId, blobUrl, durSec) {
+function renderIncomingVoice(senderConnId, blobUrl, durSec, dataUrl, mime, msgId) {
     const chatId = senderConnId;
     const ts = Date.now();
     const now = new Date(ts);
     const timeStr = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0');
     const displaySender = getDisplayName(senderConnId);
-    const el = buildVoiceMsgEl(displaySender, blobUrl, durSec, false, true, timeStr, null);
+    const el = buildVoiceMsgEl(displaySender, blobUrl, durSec, false, true, timeStr, msgId);
+    sendMediaAck(senderConnId, msgId);
     if (shouldRenderInActiveChat(chatId)) appendMsgToDOM(el);
     playBeep(true);
     const previewText = `🎤 Sesli mesaj (${durSec}s)`;
-    dbSaveMessage(chatId, { text: previewText, ts, sender: displaySender, isOwn: false, isP2P: true, isPrivate: true });
+    dbSaveMessage(chatId, { text: previewText, ts, sender: displaySender, isOwn: false, isP2P: true, isPrivate: true, kind: 'voice', media: dataUrl || null, mime: mime || 'audio/webm', dur: durSec });
     if (!(state.chatMode === 'chat' && state.activeChat === senderConnId)) {
         ozelSayac++;
         const badge = document.getElementById('convOzelBadge'); if (badge) { badge.innerText = ozelSayac; badge.classList.remove('hidden'); }
@@ -2037,7 +2171,7 @@ function handleVoicePacket(senderConnId, data) {
             for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
             const blob = new Blob([u8], { type: rec.mime });
             const url = URL.createObjectURL(blob);
-            renderIncomingVoice(senderConnId, url, rec.dur);
+            renderIncomingVoice(senderConnId, url, rec.dur, `data:${rec.mime};base64,${b64}`, rec.mime, vid);
             log(`[P2P ←] 🎤 Sesli mesaj (${rec.dur}s) ${senderConnId.substring(0,8)}`, '#22c55e');
         } catch (e) { console.warn('voice reassemble error', e); }
     }
@@ -2059,16 +2193,26 @@ async function sendVoiceMessage(targetConnId, base64Audio, durSec, mime) {
     const total = Math.ceil(base64Audio.length / VOICE_CHUNK);
     const m = mime || 'audio/webm';
     const dur = Math.max(1, Math.round(durSec || 1));
+    // Gönderim sürerken şık bir "gönderiliyor" baloncuğu göster
+    let pending = null;
+    try {
+        pending = document.createElement('div');
+        pending.className = 'msg msg-own';
+        pending.innerHTML = `<div class="msg-bubble has-media">${voicePlayerHtml('', dur, true)}</div>`;
+        appendMsgToDOM(pending);
+    } catch (e) { pending = null; }
+    const dropPending = () => { try { if (pending && pending.parentNode) pending.parentNode.removeChild(pending); } catch (e) {} };
     for (let i = 0; i < total; i++) {
         const chunk = base64Audio.slice(i * VOICE_CHUNK, (i + 1) * VOICE_CHUNK);
         const pkt = `VOICE_PART###${vid}###${i}###${total}###${m}###${dur}###${chunk}`;
         if (!put(pkt)) {
             await new Promise(r => setTimeout(r, 30));
-            if (!put(pkt)) { log('[P2P] Sesli mesaj parçası gönderilemedi', '#ef4444'); return false; }
+            if (!put(pkt)) { dropPending(); log('[P2P] Sesli mesaj parçası gönderilemedi', '#ef4444'); return false; }
         }
         if (i % 8 === 7) await new Promise(r => setTimeout(r, 10));
     }
     put(`VOICE_END###${vid}`);
+    dropPending();
 
     try {
         const bin = atob(base64Audio);
@@ -2076,13 +2220,135 @@ async function sendVoiceMessage(targetConnId, base64Audio, durSec, mime) {
         for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
         const blob = new Blob([u8], { type: m });
         const url = URL.createObjectURL(blob);
-        renderOwnVoice(targetConnId, url, dur, vid);
+        renderOwnVoice(targetConnId, url, dur, vid, `data:${m};base64,${base64Audio}`, m);
     } catch(e) {}
     log(`[P2P →] 🎤 Sesli mesaj (${dur}s) gönderildi`, '#22c55e');
     return true;
 }
 window.sendVoiceMessage = sendVoiceMessage;
 
+
+
+// ==================== MEDYA MESAJLARI (foto / video / dosya) ====================
+// Paket: MEDIA_PART###mid###idx###total###kind###mime###nameB64###b64chunk
+//        MEDIA_END###mid
+// Alıcıda parçalar birleştirilir, dataURL olarak IndexedDB'ye yazılır → sohbet
+// yeniden açıldığında medya kalıcı kalır (yalnızca "herkesten sil" ile gider).
+const _mediaRx = new Map();
+const MEDIA_CHUNK = 8000;
+
+function mediaPreviewText(kind, fileName) {
+    if (kind === 'image') return '📷 Fotoğraf';
+    if (kind === 'video') return '🎬 Video';
+    return '📎 ' + (fileName || 'Dosya');
+}
+
+function buildMediaMsgEl(opts) {
+    const { kind, dataUrl, mime, fileName, isOwn, displaySender, timeStr, msgId, status } = opts;
+    const div = document.createElement('div');
+    div.className = 'msg ' + (isOwn ? 'msg-own' : 'msg-other');
+    if (msgId) div.dataset.msgId = msgId;
+    const head = isOwn ? '' : `<div class="msg-sender">${escapeHtml(displaySender || '')}</div>`;
+    let body;
+    if (kind === 'image' && dataUrl) body = `<img class="msg-media-img" src="${dataUrl}" alt="Fotoğraf" loading="lazy">`;
+    else if (kind === 'video' && dataUrl) body = `<video class="msg-media-video" controls preload="metadata" src="${dataUrl}"></video>`;
+    else if (kind === 'voice') body = voicePlayerHtml(dataUrl, opts.dur || 0);
+    else if (dataUrl) body = `<a class="msg-media-file" href="${dataUrl}" download="${escapeHtml(fileName || 'dosya')}">📎 ${escapeHtml(fileName || 'Dosya')}</a>`;
+    else body = `<div class="msg-text" style="opacity:.6">${escapeHtml(mediaPreviewText(kind, fileName))}</div>`;
+    const tick = isOwn ? tickHtmlFor(status || 'sent') : '';
+    div.innerHTML = `<div class="msg-bubble has-media">${head}${body}<div class="msg-meta"><span class="msg-time">${timeStr}</span>${tick}</div></div>`;
+    return div;
+}
+
+function renderOwnMedia(targetConnId, kind, dataUrl, mime, fileName, msgId) {
+    const isPrivate = (targetConnId !== 'HERKES');
+    const chatId = getChatIdForMsg(targetConnId, null, true);
+    const ts = Date.now(); const d = new Date(ts);
+    const timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+    const el = buildMediaMsgEl({ kind, dataUrl, mime, fileName, isOwn: true, timeStr, msgId, status: 'sent' });
+    if (shouldRenderInActiveChat(chatId)) appendMsgToDOM(el);
+    state.sentMsgs.set(msgId, { el, status: 'sent', chatId });
+    const previewText = mediaPreviewText(kind, fileName);
+    dbSaveMessage(chatId, { text: previewText, ts, sender: 'SEN', isOwn: true, isP2P: true, isPrivate, msgId, status: 'sent', kind, media: dataUrl, mime, fileName });
+    updateConversation(targetConnId, previewText, true, isPrivate);
+}
+
+function renderIncomingMedia(senderConnId, kind, dataUrl, mime, fileName, msgId) {
+    const chatId = senderConnId;
+    const ts = Date.now(); const d = new Date(ts);
+    const timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
+    const displaySender = getDisplayName(senderConnId);
+    const el = buildMediaMsgEl({ kind, dataUrl, mime, fileName, isOwn: false, displaySender, timeStr, msgId });
+    if (shouldRenderInActiveChat(chatId)) appendMsgToDOM(el);
+    playBeep(true);
+    const previewText = mediaPreviewText(kind, fileName);
+    dbSaveMessage(chatId, { text: previewText, ts, sender: displaySender, isOwn: false, isP2P: true, isPrivate: true, msgId, kind, media: dataUrl, mime, fileName });
+    if (!(state.chatMode === 'chat' && state.activeChat === senderConnId)) {
+        ozelSayac++;
+        const badge = document.getElementById('convOzelBadge'); if (badge) { badge.innerText = ozelSayac; badge.classList.remove('hidden'); }
+        const navBadge = document.getElementById('navBadgeSohbet'); if (navBadge) { navBadge.innerText = ozelSayac; navBadge.classList.remove('hidden'); }
+    }
+    updateConversation(senderConnId, previewText, false, true);
+}
+
+function handleMediaPacket(senderConnId, data) {
+    if (data.startsWith('MEDIA_PART###')) {
+        const parts = data.split('###');
+        const mid = parts[1], idx = parseInt(parts[2],10), total = parseInt(parts[3],10);
+        const kind = parts[4] || 'file', mime = parts[5] || 'application/octet-stream';
+        let fileName = ''; try { fileName = parts[6] ? decodeURIComponent(atob(parts[6])) : ''; } catch (e) {}
+        const chunk = parts.slice(7).join('###');
+        const key = senderConnId + ':' + mid;
+        let rec = _mediaRx.get(key);
+        if (!rec) { rec = { parts: new Array(total), total, kind, mime, fileName, count: 0 }; _mediaRx.set(key, rec); }
+        if (rec.parts[idx] === undefined) { rec.parts[idx] = chunk; rec.count++; }
+    } else if (data.startsWith('MEDIA_END###')) {
+        const mid = data.split('###')[1];
+        const key = senderConnId + ':' + mid;
+        const rec = _mediaRx.get(key); if (!rec) return;
+        _mediaRx.delete(key);
+        try {
+            const dataUrl = `data:${rec.mime};base64,${rec.parts.join('')}`;
+            renderIncomingMedia(senderConnId, rec.kind, dataUrl, rec.mime, rec.fileName, mid);
+            sendMediaAck(senderConnId, mid);
+            log(`[P2P ←] ${mediaPreviewText(rec.kind, rec.fileName)}`, '#22c55e');
+        } catch (e) { console.warn('media reassemble error', e); }
+    }
+}
+
+async function sendMediaMessage(targetConnId, dataUrl, kind, mime, fileName) {
+    if (!targetConnId || targetConnId === 'HERKES' || targetConnId === CONFIG.connectionId) return false;
+    if (!dataUrl) return false;
+    const comma = dataUrl.indexOf(',');
+    const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+    const m = mime || (dataUrl.slice(5, comma > 0 ? dataUrl.indexOf(';') : 5) || 'application/octet-stream');
+    const peer = peers[targetConnId];
+    const dcReady = !!(peer && peer.dc && peer.dc.readyState === 'open');
+    const peerReady = !!(window.SohbetoPeer && SohbetoPeer.isReady());
+    if (!dcReady && !peerReady) {
+        try { initP2P(targetConnId); } catch (e) {}
+        log('[P2P] Medya için kanal hazır değil; kısa süre sonra tekrar deneyin.', '#fbbf24');
+        return false;
+    }
+    const put = (pkt) => sendDataChannelText(targetConnId, pkt) || wsSend(pkt, targetConnId);
+    const mid = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+    const total = Math.ceil(b64.length / MEDIA_CHUNK);
+    let nameB64 = ''; try { nameB64 = btoa(encodeURIComponent(fileName || '')); } catch (e) {}
+    for (let i = 0; i < total; i++) {
+        const chunk = b64.slice(i * MEDIA_CHUNK, (i + 1) * MEDIA_CHUNK);
+        const pkt = `MEDIA_PART###${mid}###${i}###${total}###${kind}###${m}###${nameB64}###${chunk}`;
+        if (!put(pkt)) {
+            await new Promise(r => setTimeout(r, 30));
+            if (!put(pkt)) { log('[P2P] Medya parçası gönderilemedi', '#ef4444'); return false; }
+        }
+        if (i % 8 === 7) await new Promise(r => setTimeout(r, 10));
+    }
+    put(`MEDIA_END###${mid}`);
+    renderOwnMedia(targetConnId, kind, dataUrl, m, fileName, mid);
+    log(`[P2P →] ${mediaPreviewText(kind, fileName)} gönderildi`, '#22c55e');
+    return true;
+}
+window.sendMediaMessage = sendMediaMessage;
 
 function showContactCard(connId) {
     cardTargetConnId = connId;
@@ -2477,7 +2743,7 @@ function openEvents() {
 
 // ==================== AUTO-RESIZE TEXTAREA ====================
 const chatInput = document.getElementById('chatInput');
-chatInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 100) + 'px'; });
+chatInput.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 132) + 'px'; });
 
 // ==================== EVENT HANDLERS ====================
 // ==================== WELCOME (lokal SMS doğrulama) ====================

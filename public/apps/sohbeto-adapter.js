@@ -818,26 +818,79 @@
       }
     };
 
-    // Ekle paneli aksiyonları (basit dosya seçici + bilgi mesajı)
-    function ciPickFile(accept, label) {
+    // ---------- Ekle paneli: gerçek medya gönderimi ----------
+    // Fotoğraf / kamera / video / dosya seçilir → dataURL'e çevrilip
+    // engine.sendMediaMessage() ile P2P gönderilir ve sohbette kalıcı kalır.
+    function _ciActiveTarget() {
+      var target = null;
+      try { target = (typeof state !== 'undefined' && state) ? (state.activeChat || state.target) : null; } catch (_) {}
+      if (!target || target === 'HERKES' || target === 'genel') return null;
+      return target;
+    }
+    function _ciFileToDataUrl(file) {
+      return new Promise(function (resolve, reject) {
+        var fr = new FileReader();
+        fr.onload = function () { resolve(String(fr.result || '')); };
+        fr.onerror = reject;
+        fr.readAsDataURL(file);
+      });
+    }
+    function _ciCompressImage(file, maxSize, quality) {
+      return new Promise(function (resolve) {
+        var fr = new FileReader();
+        fr.onload = function () {
+          var img = new Image();
+          img.onload = function () {
+            try {
+              var scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+              var cv = document.createElement('canvas');
+              cv.width = Math.max(1, Math.round(img.width * scale));
+              cv.height = Math.max(1, Math.round(img.height * scale));
+              cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+              resolve({ dataUrl: cv.toDataURL('image/jpeg', quality), mime: 'image/jpeg' });
+            } catch (e) { resolve({ dataUrl: String(fr.result || ''), mime: file.type || 'image/jpeg' }); }
+          };
+          img.onerror = function () { resolve({ dataUrl: String(fr.result || ''), mime: file.type || 'image/jpeg' }); };
+          img.src = String(fr.result || '');
+        };
+        fr.onerror = function () { resolve({ dataUrl: '', mime: '' }); };
+        fr.readAsDataURL(file);
+      });
+    }
+    async function _ciSendFile(file) {
+      window.ciClosePanels && window.ciClosePanels();
+      if (!file) return;
+      var target = _ciActiveTarget();
+      if (!target || typeof window.sendMediaMessage !== 'function') {
+        console.warn('[adapter] medya için aktif özel sohbet gerekir');
+        return;
+      }
+      var type = file.type || '';
+      var kind = type.indexOf('image/') === 0 ? 'image' : (type.indexOf('video/') === 0 ? 'video' : 'file');
+      try {
+        if (kind === 'image') {
+          var out = await _ciCompressImage(file, 1280, 0.8);
+          if (!out.dataUrl) return;
+          await window.sendMediaMessage(target, out.dataUrl, 'image', out.mime, file.name || 'foto.jpg');
+        } else {
+          if (file.size > 8 * 1024 * 1024) { console.warn('[adapter] dosya çok büyük (>8MB)'); return; }
+          var du = await _ciFileToDataUrl(file);
+          if (!du) return;
+          await window.sendMediaMessage(target, du, kind, type || 'application/octet-stream', file.name || 'dosya');
+        }
+      } catch (e) { console.warn('[adapter] medya gönderme hatası', e); }
+    }
+    function ciPickFile(accept, capture) {
       var inp = document.createElement('input');
       inp.type = 'file'; inp.accept = accept || '*/*';
-      inp.onchange = function () {
-        var f = inp.files && inp.files[0]; if (!f) return;
-        var sizeKb = Math.round(f.size / 1024);
-        var ci = document.getElementById('chatInput');
-        if (ci) {
-          ci.value = '📎 ' + (label || 'Dosya') + ': ' + f.name + ' (' + sizeKb + ' KB)';
-          try { window.updateSendIcon && window.updateSendIcon(); } catch (_) {}
-          window.sendChatMsg && window.sendChatMsg();
-        }
-        window.ciClosePanels && window.ciClosePanels();
-      };
+      if (capture) inp.capture = capture;
+      inp.onchange = function () { _ciSendFile(inp.files && inp.files[0]); };
       inp.click();
     }
     window.chatAttach     = function () { window.chatToggleAttach(); };
-    window.chatPickPhoto  = function () { ciPickFile('image/*', 'Fotoğraf'); };
-    window.chatPickDoc    = function () { ciPickFile('*/*', 'Dosya'); };
+    window.chatPickPhoto  = function () { ciPickFile('image/*,video/*'); };
+    window.chatPickDoc    = function () { ciPickFile('*/*'); };
+    window.chatCamera     = function () { ciPickFile('image/*,video/*', 'environment'); };
     window.chatPickLocation = function () {
       if (!navigator.geolocation) return;
       navigator.geolocation.getCurrentPosition(function (pos) {
@@ -849,21 +902,6 @@
         }
         window.ciClosePanels && window.ciClosePanels();
       }, function () { window.ciClosePanels && window.ciClosePanels(); });
-    };
-    window.chatCamera = function () {
-      var inp = document.createElement('input');
-      inp.type = 'file'; inp.accept = 'image/*'; inp.capture = 'environment';
-      inp.onchange = function () {
-        var f = inp.files && inp.files[0]; if (!f) return;
-        var ci = document.getElementById('chatInput');
-        if (ci) {
-          ci.value = '📷 Fotoğraf: ' + (f.name || 'kamera.jpg');
-          try { window.updateSendIcon && window.updateSendIcon(); } catch (_) {}
-          window.sendChatMsg && window.sendChatMsg();
-        }
-        window.ciClosePanels && window.ciClosePanels();
-      };
-      inp.click();
     };
 
     // ---------- Mikrofon: bas-konuş kayıt ----------
