@@ -45,12 +45,18 @@
             display: flex;
             justify-content: center;
             align-items: center;
-            min-height: 100vh;
-            min-height: var(--app-h, 100dvh);
+            /* Klavye açıldığında sayfa kaymasın: gövde görünür alana sabit. */
+            position: fixed;
+            left: 0;
+            right: 0;
+            top: 0;
+            height: var(--app-h, 100dvh);
             background-color: #f0f2f5; 
             transition: background-color 0.3s ease;
             overflow: hidden;
+            touch-action: manipulation;
         }
+
 
         .app-container {
             width: 100%;
@@ -1924,12 +1930,14 @@
     (function(){
       'use strict';
       var BUBBLES = [
-        { id:'sohbeto', label:'Sohbeto yeşili', bg:'#0a7c4a', fg:'#ffffff', bd:'rgba(0,0,0,.06)' },
+        { id:'varsayilan', label:'Sohbeto varsayılan', bg:'#0f766e', fg:'#ffffff', bd:'rgba(0,0,0,.06)' },
         { id:'klasik',  label:'Klasik yeşil',   bg:'#e7fbe1', fg:'#0f172a', bd:'rgba(10,124,74,.10)' },
+        { id:'sohbeto', label:'Sohbeto yeşili', bg:'#0a7c4a', fg:'#ffffff', bd:'rgba(0,0,0,.06)' },
         { id:'gece',    label:'Gece mavisi',    bg:'#1e293b', fg:'#f8fafc', bd:'rgba(255,255,255,.08)' },
         { id:'lila',    label:'Lila',           bg:'#ece5ff', fg:'#2b2154', bd:'rgba(84,60,160,.12)' },
         { id:'kum',     label:'Kum',            bg:'#fdf1dc', fg:'#3b2f1c', bd:'rgba(120,90,40,.12)' }
       ];
+
       var BGS = [
         { id:'varsayilan', label:'Varsayılan', css:'linear-gradient(180deg,#ffffff 0%,#eafaf0 280%)' },
         { id:'doga',       label:'Doğa',       css:'linear-gradient(180deg,#eef8ec 0%,#d7ecd8 100%)' },
@@ -1960,7 +1968,7 @@
         br.innerHTML = ''; gr.innerHTML = '';
         BUBBLES.forEach(function(b){
           var el = document.createElement('div');
-          el.className = 'cs-chip' + ((s.bubble || 'sohbeto') === b.id ? ' sel' : '');
+          el.className = 'cs-chip' + ((s.bubble || 'varsayilan') === b.id ? ' sel' : '');
           el.innerHTML = '<span class="cs-dot" style="background:' + b.bg + '"></span>' + b.label;
           el.onclick = function(){ var v = load(); v.bubble = b.id; save(v); apply(); build(); };
           br.appendChild(el);
@@ -2004,7 +2012,13 @@
       var vv = window.visualViewport;
       function applyH(){
         var h = vv ? vv.height : window.innerHeight;
+        var top = vv ? (vv.offsetTop || 0) : 0;
         document.documentElement.style.setProperty('--app-h', h + 'px');
+        document.body.style.top = top + 'px';
+        // Tarayıcı klavye açılınca tüm sayfayı kaydırıyor; geri al ki başlık sabit kalsın.
+        if (window.pageYOffset || document.documentElement.scrollTop) {
+          try { window.scrollTo(0, 0); } catch(e){}
+        }
         var box = document.getElementById('chatMessages');
         if (box && document.getElementById('screen-chat') &&
             !document.getElementById('screen-chat').classList.contains('hidden-screen')) {
@@ -2014,11 +2028,15 @@
       applyH();
       if (vv) { vv.addEventListener('resize', applyH); vv.addEventListener('scroll', applyH); }
       window.addEventListener('resize', applyH);
+      window.addEventListener('scroll', function(){ applyH(); }, { passive: true });
       window.addEventListener('orientationchange', function(){ setTimeout(applyH, 250); });
       document.addEventListener('focusin', function(e){
-        if (e.target && e.target.id === 'chatInput') setTimeout(applyH, 120);
+        if (e.target && (e.target.id === 'chatInput' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) {
+          setTimeout(applyH, 120); setTimeout(applyH, 350);
+        }
       });
-      document.addEventListener('focusout', function(){ setTimeout(applyH, 120); });
+      document.addEventListener('focusout', function(){ setTimeout(applyH, 120); setTimeout(applyH, 350); });
+
     })();
     </script>
     <script>
