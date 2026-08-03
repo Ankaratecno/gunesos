@@ -436,6 +436,74 @@
       overlay.classList.add('open');
     }
 
+    // ---------- Basılı tut → sohbeti sil ----------
+    function ooConfirmDelete(name, onYes) {
+      var back = document.createElement('div');
+      back.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:24px;animation:ooFadeIn .18s ease';
+      var box = document.createElement('div');
+      box.style.cssText = 'width:100%;max-width:320px;background:#182533;color:#e9edf2;border-radius:18px;padding:20px;box-shadow:0 18px 50px rgba(0,0,0,.5);font-family:inherit';
+      box.innerHTML =
+        '<div style="font-size:16px;font-weight:700;margin-bottom:6px">Sohbeti sil</div>' +
+        '<div style="font-size:13.5px;opacity:.75;line-height:1.45">' +
+        (name ? String(name).replace(/[<>&]/g, '') : 'Bu kişi') +
+        ' ile olan sohbet ve tüm mesajlar kalıcı olarak silinecek.</div>' +
+        '<div style="display:flex;gap:10px;margin-top:18px;justify-content:flex-end">' +
+        '<button data-x="no" style="flex:0 0 auto;padding:10px 16px;border-radius:12px;border:0;background:#233445;color:#e9edf2;font-size:14px;font-weight:600">Vazgeç</button>' +
+        '<button data-x="yes" style="flex:0 0 auto;padding:10px 16px;border-radius:12px;border:0;background:#e5484d;color:#fff;font-size:14px;font-weight:700">Sil</button>' +
+        '</div>';
+      back.appendChild(box);
+      function close() { try { back.remove(); } catch (e) {} }
+      back.addEventListener('click', function (ev) {
+        if (ev.target === back) return close();
+        var x = ev.target.getAttribute && ev.target.getAttribute('data-x');
+        if (x === 'no') return close();
+        if (x === 'yes') { close(); try { onYes(); } catch (e) {} }
+      });
+      document.body.appendChild(back);
+    }
+
+    document.addEventListener('click', function (ev) {
+      if (window.__ooLongPressAt && Date.now() - window.__ooLongPressAt < 700) {
+        if (ev.target.closest && ev.target.closest('#screen-sohbetler .content-area .conv-item')) {
+          ev.preventDefault(); ev.stopPropagation();
+          if (ev.stopImmediatePropagation) ev.stopImmediatePropagation();
+        }
+      }
+    }, true);
+
+    function bindConvLongPress(el, connId, name) {
+      var timer = null, moved = false, fired = false;
+      function trigger() {
+        fired = true;
+        window.__ooLongPressAt = Date.now();
+        try { if (navigator.vibrate) navigator.vibrate(18); } catch (e) {}
+        ooConfirmDelete(name, function () {
+          if (typeof window.deleteConversation === 'function') window.deleteConversation(connId);
+        });
+      }
+      function clear() { if (timer) { clearTimeout(timer); timer = null; } }
+      el.addEventListener('touchstart', function () {
+        moved = false; fired = false; clear();
+        timer = setTimeout(function () { if (!moved) trigger(); }, 550);
+      }, { passive: true });
+      el.addEventListener('touchmove', function () { moved = true; clear(); }, { passive: true });
+      el.addEventListener('touchend', function () { clear(); }, { passive: true });
+      el.addEventListener('touchcancel', function () { clear(); }, { passive: true });
+      el.addEventListener('mousedown', function (ev) {
+        if (ev.button !== 0) return;
+        moved = false; fired = false; clear();
+        timer = setTimeout(function () { if (!moved) trigger(); }, 550);
+      });
+      el.addEventListener('mousemove', function () { moved = true; clear(); });
+      el.addEventListener('mouseup', function () { clear(); });
+      el.addEventListener('mouseleave', function () { clear(); });
+      el.addEventListener('contextmenu', function (ev) { ev.preventDefault(); clear(); trigger(); });
+      el.addEventListener('click', function (ev) {
+        if (fired) { fired = false; ev.preventDefault(); ev.stopPropagation(); if (ev.stopImmediatePropagation) ev.stopImmediatePropagation(); }
+      }, true);
+    }
+
+
     var origRender = window.renderConvList;
     window.renderConvList = function () {
       try { if (typeof origRender === 'function') origRender.apply(this, arguments); } catch (e) { console.error(e); }
@@ -501,6 +569,7 @@
             }
           }, true);
         }
+        if (connId) bindConvLongPress(clone, connId, display);
         oo.appendChild(clone);
       });
       enterMain();
@@ -532,8 +601,8 @@
     // ---------- 2E) openChat monkey-patch → OO chat ekranını göster + başlık/avatar ----------
     var origOpenChat = window.openChat;
     window.openChat = async function (id) {
-      // OO chat ekranını hemen aç; motor mesajları yüklerken kullanıcı boş/kapalı ekran görmesin.
-      showScreen('screen-chat');
+      // Önce motor mesajları eksiksiz hazırlasın. Ekranı bundan önce açmak, özellikle
+      // büyük medya kayıtlarında boş sohbetin açılıp bilgilerin sonradan gelmesine yol açıyordu.
       try { if (typeof origOpenChat === 'function') await origOpenChat.apply(this, arguments); } catch (e) { console.error(e); }
       showScreen('screen-chat');
       // OO başlık/avatar
@@ -572,9 +641,11 @@
       if (msgs) {
         var prev = msgs.style.scrollBehavior;
         msgs.style.scrollBehavior = 'auto';
-        msgs.scrollTop = msgs.scrollHeight;
+        if (typeof window.ooPinChatBottom === 'function') window.ooPinChatBottom(msgs);
+        else msgs.scrollTop = msgs.scrollHeight;
         requestAnimationFrame(function () {
-          msgs.scrollTop = msgs.scrollHeight;
+          if (typeof window.ooPinChatBottom === 'function') window.ooPinChatBottom(msgs);
+          else msgs.scrollTop = msgs.scrollHeight;
           msgs.style.scrollBehavior = prev || '';
         });
       }
@@ -583,8 +654,14 @@
     // ---------- 2F) OO chat aksiyonları ----------
     window.closeChat = function () {
       var st = getEngineState();
-      
-      if (st) { st.chatMode = 'list'; st.activeChat = null; }
+      // Motorun kendi geri dönüş temizliğini de çalıştır; yalnızca ekran sınıfını
+      // değiştirmek medya/görüntüleyici katmanlarının geride kalmasına yol açıyordu.
+      try {
+        if (typeof backToList === 'function') backToList();
+        else if (st) { st.chatMode = 'list'; st.activeChat = null; }
+      } catch (e) {
+        if (st) { st.chatMode = 'list'; st.activeChat = null; }
+      }
       try { window.renderTypingUI && window.renderTypingUI(); } catch (e) {}
       var ac = document.querySelector('.app-container');
       if (ac) { ac.classList.remove('chat-mode'); ac.classList.add('list-mode'); }
@@ -873,7 +950,7 @@
           if (!out.dataUrl) return;
           await window.sendMediaMessage(target, out.dataUrl, 'image', out.mime, file.name || 'foto.jpg');
         } else {
-          if (file.size > 8 * 1024 * 1024) { console.warn('[adapter] dosya çok büyük (>8MB)'); return; }
+          if (file.size > 25 * 1024 * 1024) { console.warn('[adapter] dosya çok büyük (>25MB)'); return; }
           var du = await _ciFileToDataUrl(file);
           if (!du) return;
           await window.sendMediaMessage(target, du, kind, type || 'application/octet-stream', file.name || 'dosya');
@@ -890,7 +967,162 @@
     window.chatAttach     = function () { window.chatToggleAttach(); };
     window.chatPickPhoto  = function () { ciPickFile('image/*,video/*'); };
     window.chatPickDoc    = function () { ciPickFile('*/*'); };
-    window.chatCamera     = function () { ciPickFile('image/*,video/*', 'environment'); };
+    // ---------- Dahili kamera (fotoğraf çek / video kaydet) ----------
+    var __ooCam = { stream: null, rec: null, chunks: [], timer: null, startedAt: 0, facing: 'environment', mime: 'video/webm' };
+
+    function ooCamEl() {
+      var el = document.getElementById('ooCamModal');
+      if (el) return el;
+      el = document.createElement('div');
+      el.id = 'ooCamModal';
+      el.className = 'oo-cam hidden';
+      el.innerHTML =
+        '<video id="ooCamVideo" autoplay playsinline muted></video>' +
+        '<div class="oo-cam-top">' +
+          '<button type="button" class="oo-cam-btn" id="ooCamClose" aria-label="Kapat"><i class="fa-solid fa-xmark"></i></button>' +
+          '<button type="button" class="oo-cam-btn" id="ooCamFlip" aria-label="Kamerayı çevir"><i class="fa-solid fa-camera-rotate"></i></button>' +
+        '</div>' +
+        '<div class="oo-cam-timer" id="ooCamTimer">0:00</div>' +
+        '<div class="oo-cam-bottom">' +
+          '<span class="oo-cam-hint">Dokun: fotoğraf • Basılı tut: video</span>' +
+          '<button type="button" class="oo-cam-shutter" id="ooCamShutter" aria-label="Çek"></button>' +
+          '<span class="oo-cam-hint"></span>' +
+        '</div>';
+      document.body.appendChild(el);
+      el.querySelector('#ooCamClose').onclick = ooCamClose;
+      el.querySelector('#ooCamFlip').onclick = function () {
+        __ooCam.facing = __ooCam.facing === 'environment' ? 'user' : 'environment';
+        ooCamStart();
+      };
+      var sh = el.querySelector('#ooCamShutter');
+      var held = false, holdTimer = null;
+      var down = function (e) {
+        e.preventDefault(); held = false;
+        holdTimer = setTimeout(function () { held = true; ooCamStartRecording(); }, 380);
+      };
+      var up = function (e) {
+        e.preventDefault();
+        clearTimeout(holdTimer);
+        if (held) ooCamStopRecording(); else ooCamTakePhoto();
+        held = false;
+      };
+      sh.addEventListener('pointerdown', down);
+      sh.addEventListener('pointerup', up);
+      sh.addEventListener('pointercancel', function () { clearTimeout(holdTimer); if (held) ooCamStopRecording(); held = false; });
+      return el;
+    }
+
+    async function ooCamStart() {
+      var el = ooCamEl();
+      try {
+        if (__ooCam.stream) __ooCam.stream.getTracks().forEach(function (t) { t.stop(); });
+        __ooCam.stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: __ooCam.facing }, audio: true
+        });
+        var v = el.querySelector('#ooCamVideo');
+        v.srcObject = __ooCam.stream;
+        el.classList.remove('hidden');
+      } catch (e) {
+        console.warn('[adapter] kamera açılamadı', e);
+        alert('Kameraya erişilemedi. Lütfen kamera iznini verin.');
+        ooCamClose();
+      }
+    }
+
+    function ooCamClose() {
+      var el = document.getElementById('ooCamModal');
+      try { if (__ooCam.rec && __ooCam.rec.state === 'recording') __ooCam.rec.stop(); } catch (_) {}
+      try { if (__ooCam.stream) __ooCam.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (_) {}
+      __ooCam.stream = null; __ooCam.rec = null;
+      clearInterval(__ooCam.timer);
+      if (el) { el.classList.add('hidden'); el.classList.remove('recording'); }
+    }
+
+    function ooCamSendDataUrl(dataUrl, kind, mime, name) {
+      var target = _ciActiveTarget();
+      if (!target || typeof window.sendMediaMessage !== 'function') {
+        console.warn('[adapter] medya için aktif özel sohbet gerekir');
+        return;
+      }
+      window.sendMediaMessage(target, dataUrl, kind, mime, name);
+    }
+
+    function ooCamTakePhoto() {
+      var el = document.getElementById('ooCamModal');
+      var v = el && el.querySelector('#ooCamVideo');
+      if (!v || !v.videoWidth) return;
+      var maxSize = 1280;
+      var scale = Math.min(1, maxSize / Math.max(v.videoWidth, v.videoHeight));
+      var cv = document.createElement('canvas');
+      cv.width = Math.round(v.videoWidth * scale);
+      cv.height = Math.round(v.videoHeight * scale);
+      var ctx = cv.getContext('2d');
+      if (__ooCam.facing === 'user') { ctx.translate(cv.width, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(v, 0, 0, cv.width, cv.height);
+      var dataUrl = cv.toDataURL('image/jpeg', 0.82);
+      ooCamClose();
+      ooCamSendDataUrl(dataUrl, 'image', 'image/jpeg', 'foto-' + Date.now() + '.jpg');
+    }
+
+    function ooCamPickVideoMime() {
+      var cands = ['video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+      for (var i = 0; i < cands.length; i++) {
+        try { if (window.MediaRecorder && MediaRecorder.isTypeSupported(cands[i])) return cands[i]; } catch (_) {}
+      }
+      return 'video/webm';
+    }
+
+    function ooCamStartRecording() {
+      if (!__ooCam.stream || !window.MediaRecorder) return;
+      var el = document.getElementById('ooCamModal');
+      try {
+        __ooCam.mime = ooCamPickVideoMime();
+        __ooCam.chunks = [];
+        __ooCam.rec = new MediaRecorder(__ooCam.stream, { mimeType: __ooCam.mime, videoBitsPerSecond: 900000 });
+        __ooCam.rec.ondataavailable = function (e) { if (e.data && e.data.size) __ooCam.chunks.push(e.data); };
+        __ooCam.rec.onstop = ooCamFinishRecording;
+        __ooCam.rec.start(200);
+        __ooCam.startedAt = Date.now();
+        el.classList.add('recording');
+        var t = el.querySelector('#ooCamTimer');
+        __ooCam.timer = setInterval(function () {
+          var s = Math.floor((Date.now() - __ooCam.startedAt) / 1000);
+          t.textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+          if (s >= 30) ooCamStopRecording(); // güvenli üst sınır
+        }, 250);
+      } catch (e) { console.warn('[adapter] video kaydı başlatılamadı', e); }
+    }
+
+    function ooCamStopRecording() {
+      clearInterval(__ooCam.timer);
+      var el = document.getElementById('ooCamModal');
+      if (el) el.classList.remove('recording');
+      try { if (__ooCam.rec && __ooCam.rec.state === 'recording') __ooCam.rec.stop(); } catch (_) {}
+    }
+
+    function ooCamFinishRecording() {
+      var blob = new Blob(__ooCam.chunks, { type: __ooCam.mime });
+      __ooCam.chunks = [];
+      ooCamClose();
+      if (!blob.size) return;
+      if (blob.size > 8 * 1024 * 1024) { alert('Video çok büyük (8MB üstü). Daha kısa çekin.'); return; }
+      var fr = new FileReader();
+      fr.onload = function () {
+        var du = String(fr.result || '');
+        if (du) ooCamSendDataUrl(du, 'video', __ooCam.mime, 'video-' + Date.now() + '.webm');
+      };
+      fr.readAsDataURL(blob);
+    }
+
+    window.chatCamera = function () {
+      window.ciClosePanels && window.ciClosePanels();
+      if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+        ciPickFile('image/*,video/*', 'environment');
+        return;
+      }
+      ooCamStart();
+    };
+
     window.chatPickLocation = function () {
       if (!navigator.geolocation) return;
       navigator.geolocation.getCurrentPosition(function (pos) {

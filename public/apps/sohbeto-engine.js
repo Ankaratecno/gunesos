@@ -187,6 +187,8 @@ async function dbGet(key) { const db = await openDB(); return new Promise(r => {
 async function dbPut(key, val) { const db = await openDB(); return new Promise(r => { const tx = db.transaction("identity","readwrite"); tx.objectStore("identity").put(val,key); tx.oncomplete=()=>r(); }); }
 
 // Message persistence with hash-based IDs
+// Bellek içi mesaj önbelleği: sohbet açılışındaki IndexedDB gecikmesini yok eder.
+const _msgCache = new Map(); // chatId -> [records]
 async function hashMsg(data) { return sha256(data + '::' + Date.now()); }
 async function dbSaveMessage(chatId, msgData) {
     try {
@@ -194,6 +196,10 @@ async function dbSaveMessage(chatId, msgData) {
         const msgHash = await sha256(chatId + '::' + msgData.text + '::' + msgData.ts + '::' + (msgData.msgId||''));
         const record = { chatId, hash: msgHash, ts: msgData.ts, sender: msgData.sender, text: msgData.text, isOwn: msgData.isOwn, isP2P: msgData.isP2P, isPrivate: msgData.isPrivate, msgId: msgData.msgId || null, status: msgData.status || 'sent',
             kind: msgData.kind || 'text', media: msgData.media || null, mime: msgData.mime || null, dur: msgData.dur || 0, fileName: msgData.fileName || null };
+        try {
+            const cached = _msgCache.get(chatId);
+            if (cached) { cached.push(record); if (cached.length > 400) cached.splice(0, cached.length - 400); }
+        } catch (e) {}
         return new Promise(r => {
             const tx = db.transaction("messages", "readwrite");
             tx.objectStore("messages").add(record);
@@ -203,13 +209,20 @@ async function dbSaveMessage(chatId, msgData) {
     } catch (e) { return; }
 }
 async function dbLoadMessages(chatId, limit = 200) {
+    const hit = _msgCache.get(chatId);
+    if (hit) return hit.slice(-limit);
     try {
         const db = await openDB();
         return new Promise(r => {
             const tx = db.transaction("messages", "readonly");
             const idx = tx.objectStore("messages").index("chatId");
             const req = idx.getAll(chatId);
-            req.onsuccess = () => { const arr = req.result || []; arr.sort((a,b)=>a.ts-b.ts); r(arr.slice(-limit)); };
+            req.onsuccess = () => {
+                const arr = req.result || [];
+                arr.sort((a,b)=>a.ts-b.ts);
+                try { _msgCache.set(chatId, arr.slice(-400)); } catch (e) {}
+                r(arr.slice(-limit));
+            };
             req.onerror = () => r([]);
         });
     } catch (e) { return []; }
@@ -236,7 +249,20 @@ async function dbLoadConversations() {
         });
     } catch (e) { return []; }
 }
+async function dbDeleteConversation(connId) {
+    try {
+        const db = await openDB();
+        return new Promise(r => {
+            const tx = db.transaction("conversations", "readwrite");
+            tx.objectStore("conversations").delete(connId);
+            tx.oncomplete = () => r();
+            tx.onerror = () => r();
+        });
+    } catch (e) { return; }
+}
 async function dbClearMessages(chatId) {
+    try { _msgCache.delete(chatId); } catch (e) {}
+    try { _chatDomCache.delete(chatId); } catch (e) {}
     try {
         const db = await openDB();
         return new Promise(r => {
@@ -251,6 +277,8 @@ async function dbClearMessages(chatId) {
 
 // ---- Mesaj silme yardımcıları (msgId indexlenmediği için cursor ile taranır) ----
 async function dbDeleteMessageByMsgId(msgId) {
+    try { _msgCache.clear(); } catch (e) {}
+    try { _chatDomCache.clear(); } catch (e) {}
     if (!msgId) return;
     try {
         const db = await openDB();
@@ -281,6 +309,8 @@ async function dbUpdateMessageStatus(msgId, status) {
     } catch (e) { return; }
 }
 async function dbMarkMessageDeleted(msgId) {
+    try { _msgCache.clear(); } catch (e) {}
+    try { _chatDomCache.clear(); } catch (e) {}
     if (!msgId) return;
     try {
         const db = await openDB();
@@ -1202,8 +1232,30 @@ function shouldRenderInActiveChat(chatId) {
 function appendMsgToDOM(div) {
     const container = document.getElementById('chatMessages');
     container.appendChild(div);
-    container.scrollTop = container.scrollHeight;
+    pinChatToBottom(container);
 }
+
+// Sohbet açılırken ve fotoğraf/video boyutu sonradan belli olduğunda son mesajı
+// giriş çubuğunun hemen üstünde tut. Tek bir scrollTop ataması medya yüklenince
+// geçersiz kaldığı için iki frame ve medya load olayı birlikte izlenir.
+function pinChatToBottom(container) {
+    const box = container || document.getElementById('chatMessages');
+    if (!box) return;
+    const pin = () => { box.scrollTop = Math.max(0, box.scrollHeight - box.clientHeight); };
+    pin();
+    requestAnimationFrame(() => {
+        pin();
+        requestAnimationFrame(pin);
+    });
+    box.querySelectorAll('img,video').forEach(media => {
+        if (media.dataset.bottomPinBound) return;
+        media.dataset.bottomPinBound = '1';
+        media.addEventListener('load', pin, { once: true });
+        media.addEventListener('loadedmetadata', pin, { once: true });
+        media.addEventListener('error', pin, { once: true });
+    });
+}
+window.ooPinChatBottom = pinChatToBottom;
 
 // Tek tik sistemi: gri = gönderildi, yeşil = iletildi, mavi = okundu.
 function tickHtmlFor(status) {
@@ -1329,6 +1381,106 @@ function renderConvList() {
     if (ozelCount === 0) ozelList.innerHTML = '';
 }
 
+// ---- Sohbet DOM önbelleği (arka planda hazırlanır) ----
+// chatId -> { count, els: HTMLElement[] }
+const _chatDomCache = new Map();
+
+function buildChatDom(id, msgs) {
+    const hit = _chatDomCache.get(id);
+    if (hit && hit.count === msgs.length) return hit.els;
+    const els = msgs.map(m => {
+        const d = new Date(m.ts);
+        const timeStr = d.getHours().toString().padStart(2, '0') + ':' + d.getMinutes().toString().padStart(2, '0');
+        let el;
+        const kind = m.kind || 'text';
+        if (kind !== 'text' && !m.deleted) {
+            el = buildMediaMsgEl({ kind, dataUrl: m.media, mime: m.mime, fileName: m.fileName, isOwn: !!m.isOwn, displaySender: m.sender || '', timeStr, msgId: m.msgId, status: m.status || 'sent', dur: m.dur || 0 });
+            if (m.isOwn && m.msgId) state.sentMsgs.set(m.msgId, { el, status: m.status || 'sent', chatId: id });
+        } else if (m.isOwn) {
+            el = buildOwnMsgEl(m.text, m.msgId, m.isP2P, timeStr, m.status || 'sent');
+            if (m.msgId) {
+                const existing = state.sentMsgs.get(m.msgId);
+                if (existing) { existing.el = el; } else { state.sentMsgs.set(m.msgId, { el, status: m.status || 'sent', chatId: id }); }
+            }
+        } else {
+            el = buildIncomingMsgEl(m.sender || 'Bilinmiyor', m.text, m.isP2P, m.isPrivate, timeStr, m.msgId);
+        }
+        if (m.deleted) markMsgElDeleted(el);
+        el.style.animation = 'none'; // giriş animasyonu yok → anında görünür
+        return el;
+    });
+    _chatDomCache.set(id, { count: msgs.length, els });
+    return els;
+}
+window.invalidateChatDom = function (id) { if (id) _chatDomCache.delete(id); else _chatDomCache.clear(); };
+
+// Arka planda tüm sohbetleri ısıt: mesajlar → blob URL'leri → DOM balonları.
+// Boşta (idle) zamanda, sohbet sohbet ilerler; böylece kullanıcı hangi sohbete
+// girerse girsin hiçbir yükleme/gecikme hissetmez.
+function idle(fn) {
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(fn, { timeout: 1500 });
+    else setTimeout(fn, 60);
+}
+async function prewarmAllChats() {
+    const ids = Array.from(state.conversations.keys()).reverse(); // en yeniden eskiye
+    for (const id of ids) {
+        await new Promise(res => idle(res));
+        try {
+            const msgs = await dbLoadMessages(id, 200);
+            if (!msgs || !msgs.length) continue;
+            // Medya blob'larını önden oluştur (data: → blob:)
+            for (const m of msgs) {
+                if (m && m.media && typeof m.media === 'string' && m.media.startsWith('data:')) {
+                    mediaSrc(m.media);
+                    await new Promise(res => idle(res));
+                }
+            }
+            if (state.activeChat !== id) buildChatDom(id, msgs);
+        } catch (e) {}
+    }
+}
+window.prewarmAllChats = prewarmAllChats;
+
+// ---- Sohbet listesi kalıcılığı (IndexedDB → state.conversations) ----
+async function loadConversationsToState() {
+    try {
+        const rows = await dbLoadConversations();
+        rows.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+        rows.forEach(row => {
+            if (!row || !row.connId) return;
+            const { connId, ...conv } = row;
+            if (state.conversations.has(connId)) return;
+            state.conversations.set(connId, {
+                nick: conv.nick || '',
+                lastMsg: conv.lastMsg || '',
+                time: conv.time || '',
+                unread: conv.unread || 0,
+                isPrivate: conv.isPrivate !== false,
+                ts: conv.ts || 0
+            });
+        });
+        try { renderConvList(); } catch (e) {}
+        // Açılış gecikmesini yok etmek için TÜM sohbetler arka planda ısıtılır.
+        prewarmAllChats();
+    } catch (e) {}
+}
+
+
+// ---- Sohbeti sil (basılı tut) ----
+async function deleteConversation(connId) {
+    if (!connId) return;
+    state.conversations.delete(connId);
+    _msgCache.delete(connId);
+    try { _chatDomCache.delete(connId); } catch (e) {}
+    try { await dbDeleteConversation(connId); } catch (e) {}
+    try { await dbClearMessages(connId); } catch (e) {}
+    try {
+        if (state.activeChat === connId && typeof backToList === 'function') backToList();
+    } catch (e) {}
+    try { renderConvList(); } catch (e) {}
+}
+window.deleteConversation = deleteConversation;
+
 function getAvatarColor(name) { let hash = 0; for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash); return 'avatar-c' + (Math.abs(hash) % 8); }
 function getInitials(name) { const clean = name.replace(/\[.*?\]/g, '').trim(); const parts = clean.split(/\s+/); if (parts.length >= 2 && parts[1]) return (parts[0][0] + parts[1][0]).toUpperCase(); return clean.substring(0, 2).toUpperCase(); }
 
@@ -1361,40 +1513,35 @@ async function openChat(id) {
     const container = document.getElementById('chatMessages');
     const prevBehavior = container.style.scrollBehavior;
     container.style.scrollBehavior = 'auto';
-    container.innerHTML = '';
-    const msgs = await dbLoadMessages(id, 200);
-    if (msgs.length === 0) {
+    // Önbellek sıcaksa await yok → sohbet aynı karede açılır (WhatsApp/Telegram gibi).
+    const msgs = _msgCache.get(id) || await dbLoadMessages(id, 200);
+    // Aynı sohbet yeniden açılıyorsa ve kayıt sayısı değişmediyse mevcut DOM'u
+    // koru. Özellikle büyük fotoğraf/video blob'larını tekrar kurmak gecikmeye
+    // ve balonların sonradan beliriyormuş gibi görünmesine neden oluyordu.
+    const canReuse = container.dataset.chatId === id &&
+        Number(container.dataset.messageCount || '-1') === msgs.length &&
+        container.querySelectorAll(':scope > .msg').length === msgs.length;
+    if (canReuse) {
+        pinChatToBottom(container);
+        container.style.scrollBehavior = prevBehavior || '';
+    } else if (msgs.length === 0) {
         // Boş sohbette placeholder/baloncuk gösterilmez — sohbet tamamen temiz açılır.
         container.innerHTML = '';
+        container.dataset.chatId = id;
+        container.dataset.messageCount = '0';
     } else {
+        container.innerHTML = '';
+        const els = buildChatDom(id, msgs);
         const frag = document.createDocumentFragment();
-        msgs.forEach(m => {
-            const d = new Date(m.ts);
-            const timeStr = d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0');
-            let el;
-            const kind = m.kind || 'text';
-            if (kind !== 'text' && !m.deleted) {
-                el = buildMediaMsgEl({ kind, dataUrl: m.media, mime: m.mime, fileName: m.fileName, isOwn: !!m.isOwn, displaySender: m.sender || '', timeStr, msgId: m.msgId, status: m.status || 'sent', dur: m.dur || 0 });
-                if (m.isOwn && m.msgId) state.sentMsgs.set(m.msgId, { el, status: m.status || 'sent', chatId: id });
-            } else if (m.isOwn) {
-                el = buildOwnMsgEl(m.text, m.msgId, m.isP2P, timeStr, m.status || 'sent');
-                if (m.msgId) {
-                    const existing = state.sentMsgs.get(m.msgId);
-                    if (existing) { existing.el = el; } else { state.sentMsgs.set(m.msgId, { el, status: m.status || 'sent', chatId: id }); }
-                }
-            } else {
-                el = buildIncomingMsgEl(m.sender || 'Bilinmiyor', m.text, m.isP2P, m.isPrivate, timeStr, m.msgId);
-            }
-            if (m.deleted) markMsgElDeleted(el);
-            // Mesajlara giriş animasyonunu kapat
-            el.style.animation = 'none';
-            frag.appendChild(el);
-        });
+        els.forEach(el => frag.appendChild(el));
         container.appendChild(frag);
-        // Force reflow ve anında en alta in
-        container.scrollTop = container.scrollHeight;
-        requestAnimationFrame(() => { container.scrollTop = container.scrollHeight; container.style.scrollBehavior = prevBehavior || ''; });
+        container.dataset.chatId = id;
+        container.dataset.messageCount = String(msgs.length);
+        // Medya ölçüleri sonradan oluşsa bile son mesajı tabanda tut.
+        pinChatToBottom(container);
+        requestAnimationFrame(() => { pinChatToBottom(container); container.style.scrollBehavior = prevBehavior || ''; });
     }
+
 
     if (id !== 'genel') { const conv = state.conversations.get(id); if (conv) { conv.unread = 0; renderConvList(); dbSaveConversation(id, conv); } switchConvTab('ozel'); }
     document.getElementById('pageConvList').className = 'swipe-page left';
@@ -1414,6 +1561,9 @@ function backToList() {
     document.getElementById('topbarAudioCall').classList.add('hidden');
     document.getElementById('pageConvList').className = 'swipe-page center';
     document.getElementById('pageChat').className = 'swipe-page right';
+    // Görüntüleyici veya odak sohbet ekranından geri dönüşte iz bırakmasın.
+    try { closeMediaViewer(); } catch (e) {}
+    try { document.activeElement?.blur(); } catch (e) {}
     renderConvList();
 }
 
@@ -1805,6 +1955,7 @@ async function flushOutboundQueue() {
 
 // ==================== ACK ====================
 function handleAck(msgId, status) {
+    try { if (status === 'DELIVERED' || status === 'READ') completeMediaUpload(msgId); } catch (e) {}
     const entry = state.sentMsgs.get(msgId); if (!entry) return;
     const tickEl = entry.el.querySelector('[data-tick]'); if (!tickEl) return;
     if (status === 'DELIVERED' && entry.status !== 'read') { tickEl.innerHTML = '✓'; tickEl.className = 'tick green'; tickEl.dataset.tick = 'delivered'; entry.status = 'delivered'; dbUpdateMessageStatus(msgId, 'delivered'); if (state.outboundQueue.has(msgId)) { state.outboundQueue.delete(msgId); saveOutbox(); } }
@@ -2235,7 +2386,7 @@ window.sendVoiceMessage = sendVoiceMessage;
 // Alıcıda parçalar birleştirilir, dataURL olarak IndexedDB'ye yazılır → sohbet
 // yeniden açıldığında medya kalıcı kalır (yalnızca "herkesten sil" ile gider).
 const _mediaRx = new Map();
-const MEDIA_CHUNK = 8000;
+const MEDIA_CHUNK = 16000;
 
 function mediaPreviewText(kind, fileName) {
     if (kind === 'image') return '📷 Fotoğraf';
@@ -2243,18 +2394,46 @@ function mediaPreviewText(kind, fileName) {
     return '📎 ' + (fileName || 'Dosya');
 }
 
+// data:URL → blob:URL dönüşümü (önbellekli).
+// Neden: 5–25 MB'lık base64 data:URL'i doğrudan <img>/<video>/<a> src'ine
+// koymak, her açılışta tarayıcıyı o devasa string'i parse etmeye zorlar ve
+// balonlar "geç açılır". blob: URL'de veri bir kez belleğe alınır, render anında.
+const _blobUrlCache = new Map();
+function mediaSrc(dataUrl) {
+    if (!dataUrl || typeof dataUrl !== 'string') return dataUrl || '';
+    if (!dataUrl.startsWith('data:')) return dataUrl;
+    const hit = _blobUrlCache.get(dataUrl);
+    if (hit) return hit;
+    try {
+        const comma = dataUrl.indexOf(',');
+        const meta = dataUrl.slice(5, comma);
+        const mime = meta.split(';')[0] || 'application/octet-stream';
+        const bin = atob(dataUrl.slice(comma + 1));
+        const len = bin.length;
+        const buf = new Uint8Array(len);
+        for (let i = 0; i < len; i++) buf[i] = bin.charCodeAt(i);
+        const url = URL.createObjectURL(new Blob([buf], { type: mime }));
+        _blobUrlCache.set(dataUrl, url);
+        return url;
+    } catch (e) { return dataUrl; }
+}
+window.mediaSrc = mediaSrc;
+
 function buildMediaMsgEl(opts) {
     const { kind, dataUrl, mime, fileName, isOwn, displaySender, timeStr, msgId, status } = opts;
     const div = document.createElement('div');
     div.className = 'msg ' + (isOwn ? 'msg-own' : 'msg-other');
     if (msgId) div.dataset.msgId = msgId;
     const head = isOwn ? '' : `<div class="msg-sender">${escapeHtml(displaySender || '')}</div>`;
+    const src = dataUrl ? mediaSrc(dataUrl) : '';
     let body;
-    if (kind === 'image' && dataUrl) body = `<img class="msg-media-img" src="${dataUrl}" alt="Fotoğraf" loading="lazy">`;
-    else if (kind === 'video' && dataUrl) body = `<video class="msg-media-video" controls preload="metadata" src="${dataUrl}"></video>`;
-    else if (kind === 'voice') body = voicePlayerHtml(dataUrl, opts.dur || 0);
-    else if (dataUrl) body = `<a class="msg-media-file" href="${dataUrl}" download="${escapeHtml(fileName || 'dosya')}">📎 ${escapeHtml(fileName || 'Dosya')}</a>`;
+    if (kind === 'image' && dataUrl) body = `<div class="oo-media-wrap"><img class="msg-media-img" src="${src}" alt="Fotoğraf" loading="lazy" decoding="async" onclick="openMediaViewer(this.src,'image')"></div>`;
+    else if (kind === 'video' && dataUrl) body = `<div class="oo-media-wrap oo-video-wrap" onclick="openMediaViewer(this.querySelector('video').src,'video')"><video class="msg-media-video" preload="metadata" muted playsinline src="${src}#t=0.1"></video><span class="oo-play-badge"><i class="fa-solid fa-play"></i></span></div>`;
+    else if (kind === 'voice') body = voicePlayerHtml(src || dataUrl, opts.dur || 0);
+    else if (dataUrl) body = `<a class="msg-media-file" href="${src}" download="${escapeHtml(fileName || 'dosya')}"><span class="oo-file-ic"><i class="fa-solid fa-file-lines"></i></span><span class="oo-file-name">${escapeHtml(fileName || 'Dosya')}</span></a>`;
     else body = `<div class="msg-text" style="opacity:.6">${escapeHtml(mediaPreviewText(kind, fileName))}</div>`;
+
+
     const tick = isOwn ? tickHtmlFor(status || 'sent') : '';
     div.innerHTML = `<div class="msg-bubble has-media">${head}${body}<div class="msg-meta"><span class="msg-time">${timeStr}</span>${tick}</div></div>`;
     return div;
@@ -2271,7 +2450,77 @@ function renderOwnMedia(targetConnId, kind, dataUrl, mime, fileName, msgId) {
     const previewText = mediaPreviewText(kind, fileName);
     dbSaveMessage(chatId, { text: previewText, ts, sender: 'SEN', isOwn: true, isP2P: true, isPrivate, msgId, status: 'sent', kind, media: dataUrl, mime, fileName });
     updateConversation(targetConnId, previewText, true, isPrivate);
+    return el;
 }
+
+// ---- Medya görüntüleyici (lightbox) ----
+function openMediaViewer(src, kind) {
+    if (!src) return;
+    let ov = document.getElementById('ooMediaViewer');
+    if (!ov) {
+        ov = document.createElement('div');
+        ov.id = 'ooMediaViewer';
+        ov.className = 'oo-viewer hidden';
+        ov.innerHTML = `<button class="oo-viewer-close" aria-label="Kapat"><i class="fa-solid fa-xmark"></i></button><div class="oo-viewer-body"></div>`;
+        document.body.appendChild(ov);
+        ov.addEventListener('click', (e) => { if (e.target === ov || e.target.closest('.oo-viewer-close')) closeMediaViewer(); });
+    }
+    const body = ov.querySelector('.oo-viewer-body');
+    body.innerHTML = kind === 'video'
+        ? `<video src="${src}" controls autoplay playsinline></video>`
+        : `<img src="${src}" alt="Medya">`;
+    ov.classList.remove('hidden');
+}
+function closeMediaViewer() {
+    const ov = document.getElementById('ooMediaViewer');
+    if (!ov) return;
+    const v = ov.querySelector('video'); if (v) { try { v.pause(); } catch (e) {} }
+    ov.querySelector('.oo-viewer-body').innerHTML = '';
+    ov.classList.add('hidden');
+}
+window.openMediaViewer = openMediaViewer;
+window.closeMediaViewer = closeMediaViewer;
+
+// ---- Gönderim yüzdesi (soldan sağa dolan bar) ----
+function attachUploadProgress(el) {
+    if (!el) return null;
+    const bubble = el.querySelector('.msg-bubble');
+    if (!bubble) return null;
+    const wrap = document.createElement('div');
+    wrap.className = 'oo-upload';
+    wrap.innerHTML = `<div class="oo-upload-track"><i></i></div><span class="oo-upload-pct">0%</span>`;
+    bubble.appendChild(wrap);
+    el.classList.add('is-uploading');
+    return wrap;
+}
+function setUploadProgress(wrap, pct, note) {
+    if (!wrap) return;
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const bar = wrap.querySelector('i'); if (bar) bar.style.width = p + '%';
+    const lbl = wrap.querySelector('.oo-upload-pct');
+    if (lbl) lbl.textContent = note ? (p + '% · ' + note) : (p + '%');
+}
+function finishUploadProgress(wrap, el) {
+    setUploadProgress(wrap, 100);
+    setTimeout(() => {
+        try { if (wrap && wrap.parentNode) wrap.parentNode.removeChild(wrap); } catch (e) {}
+        if (el) el.classList.remove('is-uploading');
+    }, 260);
+}
+// mid -> { wrap, el } : karşı taraf MEDIA'yı tam alınca (MSG_ACK) %100 olur
+const _mediaUploads = new Map();
+function completeMediaUpload(mid) {
+    const rec = _mediaUploads.get(mid); if (!rec) return;
+    _mediaUploads.delete(mid);
+    if (rec.timer) clearTimeout(rec.timer);
+    finishUploadProgress(rec.wrap, rec.el);
+}
+function humanBytes(n) {
+    if (!isFinite(n) || n <= 0) return '0 KB';
+    if (n < 1024 * 1024) return Math.round(n / 1024) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+}
+
 
 function renderIncomingMedia(senderConnId, kind, dataUrl, mime, fileName, msgId) {
     const chatId = senderConnId;
@@ -2333,18 +2582,59 @@ async function sendMediaMessage(targetConnId, dataUrl, kind, mime, fileName) {
     const put = (pkt) => sendDataChannelText(targetConnId, pkt) || wsSend(pkt, targetConnId);
     const mid = 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
     const total = Math.ceil(b64.length / MEDIA_CHUNK);
+    const totalBytes = Math.floor(b64.length * 0.75);
     let nameB64 = ''; try { nameB64 = btoa(encodeURIComponent(fileName || '')); } catch (e) {}
+    const ownEl = renderOwnMedia(targetConnId, kind, dataUrl, m, fileName, mid);
+    const prog = attachUploadProgress(ownEl);
+    setUploadProgress(prog, 0, '0 KB / ' + humanBytes(totalBytes));
+
+    // Gerçek akış: veri kanalının tampon (bufferedAmount) durumu izlenir.
+    // Böylece bar "kuyruğa aldım" değil, "hat üzerinden gerçekten gitti"yi gösterir.
+    const HIGH = 256 * 1024, LOW = 64 * 1024;
+    const dcOf = () => { const p = peers[targetConnId]; return (p && p.dc && p.dc.readyState === 'open') ? p.dc : null; };
+    const buffered = () => { const dc = dcOf(); return dc ? (dc.bufferedAmount || 0) : 0; };
+    const started = Date.now();
+    const paint = (queuedChars) => {
+        const sentChars = Math.max(0, queuedChars - (buffered() / 1) );
+        const sentBytes = Math.min(totalBytes, Math.floor(sentChars * 0.75));
+        const pct = Math.min(97, (sentBytes / Math.max(1, totalBytes)) * 100);
+        const secs = (Date.now() - started) / 1000;
+        const rate = secs > 0.4 ? humanBytes(sentBytes / secs) + '/sn' : '';
+        setUploadProgress(prog, pct, humanBytes(sentBytes) + ' / ' + humanBytes(totalBytes) + (rate ? ' · ' + rate : ''));
+    };
+
+    let queuedChars = 0;
     for (let i = 0; i < total; i++) {
+        // Tampon dolduysa boşalana kadar bekle (backpressure) → gerçekçi hız
+        let guard = 0;
+        while (buffered() > HIGH && guard++ < 2000) {
+            await new Promise(r => setTimeout(r, 40));
+            paint(queuedChars);
+        }
         const chunk = b64.slice(i * MEDIA_CHUNK, (i + 1) * MEDIA_CHUNK);
         const pkt = `MEDIA_PART###${mid}###${i}###${total}###${kind}###${m}###${nameB64}###${chunk}`;
         if (!put(pkt)) {
-            await new Promise(r => setTimeout(r, 30));
-            if (!put(pkt)) { log('[P2P] Medya parçası gönderilemedi', '#ef4444'); return false; }
+            await new Promise(r => setTimeout(r, 60));
+            if (!put(pkt)) { finishUploadProgress(prog, ownEl); log('[P2P] Medya parçası gönderilemedi', '#ef4444'); return false; }
         }
-        if (i % 8 === 7) await new Promise(r => setTimeout(r, 10));
+        queuedChars += chunk.length;
+        paint(queuedChars);
+        // Her 2 parçada bir olay döngüsüne dön: arayüz (yazma/scroll/yeni mesaj)
+        // gönderim sırasında donmasın, balonlar geç açılmasın.
+        if (i % 2 === 1) await new Promise(r => setTimeout(r, 0));
     }
+    // Tüm parçalar hattan çıkana kadar bekle
+    let drain = 0;
+    while (buffered() > LOW && drain++ < 1500) { await new Promise(r => setTimeout(r, 40)); paint(queuedChars); }
+
     put(`MEDIA_END###${mid}`);
-    renderOwnMedia(targetConnId, kind, dataUrl, m, fileName, mid);
+    setUploadProgress(prog, 98, 'karşı taraf alıyor…');
+    // %100 + yeşil tik: alıcıdan MSG_ACK gelince (completeMediaUpload)
+    _mediaUploads.set(mid, {
+        wrap: prog, el: ownEl,
+        timer: setTimeout(() => completeMediaUpload(mid), 45000)
+    });
+
     log(`[P2P →] ${mediaPreviewText(kind, fileName)} gönderildi`, '#22c55e');
     return true;
 }
@@ -2998,6 +3288,7 @@ async function init() {
 
     const identity = await loadIdentity(); loadOutbox(); initAvatarGrid(); updateProfilePics();
     await loadContactsToState();
+    await loadConversationsToState();
     const splashStart = Date.now();
     const SPLASH_MIN = 2500;
     const finishSplash = () => {

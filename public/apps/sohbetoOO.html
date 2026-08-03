@@ -75,9 +75,7 @@
             transition: background-color 0.3s ease;
         }
 
-        .app-container.instant-open .screen {
-            transition: opacity .12s ease, background-color .3s ease;
-        }
+        .app-container.instant-open .screen { transition: none; }
 
         @media (max-width: 600px) {
             .app-container {
@@ -129,10 +127,15 @@
         }
         .hidden-screen {
             opacity: 0;
+            visibility: hidden;
             pointer-events: none;
             transform: translateX(0);
             z-index: 5;
+            transition: none;
         }
+
+        /* Gizlenen sohbet katmanı bir kare dahi alttaki ekrana sızmamalı. */
+        #screen-chat.hidden-screen { display:none; }
 
         .content-area {
             flex: 1;
@@ -598,11 +601,13 @@
 
         .chat-messages {
             flex:1; overflow-y:auto;
-            padding:14px 14px 12px;
+            padding:14px 14px 4px;
             display:flex; flex-direction:column; gap:8px;
             background:var(--oo-chat-bg, linear-gradient(180deg, var(--bg-white) 0%, var(--light-green-bg) 280%));
             background-attachment:local;
         }
+        /* Kısa sohbetlerde de son mesaj giriş alanının hemen üstünde başlar. */
+        .chat-messages::before { content:''; margin-top:auto; flex:0 0 0; }
         .chat-messages::-webkit-scrollbar { display:none; }
         /* "yazıyor…" animasyonu daima en altta kalsın (flex order) */
         .chat-messages > #typingIndicator { order:99999; }
@@ -826,9 +831,96 @@
         }
         @keyframes ovLoad { 0%{ width:12%; opacity:.18 } 50%{ width:86%; opacity:.4 } 100%{ width:12%; opacity:.18 } }
         .chat-messages .msg-media-file {
-            display:block; padding:8px 10px; font-size:.85rem;
-            color:var(--primary-green); text-decoration:none; font-weight:600;
+            display:flex; align-items:center; gap:9px; padding:9px 11px; font-size:.85rem;
+            color:inherit; text-decoration:none; font-weight:600; max-width:250px;
         }
+        .chat-messages .msg-media-file .oo-file-ic {
+            flex:none; width:32px; height:32px; border-radius:9px; display:flex;
+            align-items:center; justify-content:center; font-size:.85rem;
+            background:rgba(255,255,255,.22); color:inherit;
+        }
+        .chat-messages .msg-other .msg-media-file .oo-file-ic,
+        .chat-messages .msg-private .msg-media-file .oo-file-ic { background:var(--primary-green); color:#fff; }
+        .chat-messages .msg-media-file .oo-file-name {
+            flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        }
+        /* Medya kutusu + video oynat rozeti */
+        .chat-messages .oo-media-wrap { position:relative; display:block; cursor:pointer; }
+        .chat-messages .oo-media-wrap .msg-media-img,
+        .chat-messages .oo-media-wrap .msg-media-video { cursor:pointer; }
+        .chat-messages .oo-play-badge {
+            position:absolute; inset:0; margin:auto; width:46px; height:46px; border-radius:50%;
+            display:flex; align-items:center; justify-content:center; color:#fff; font-size:1rem;
+            background:rgba(0,0,0,.45); backdrop-filter:blur(3px); pointer-events:none;
+            box-shadow:0 4px 14px rgba(0,0,0,.35);
+        }
+        /* Gönderim yüzdesi barı */
+        .chat-messages .oo-upload {
+            display:flex; align-items:center; gap:7px; padding:5px 7px 2px;
+        }
+        .chat-messages .oo-upload-track {
+            flex:1; height:4px; border-radius:4px; overflow:hidden;
+            background:rgba(0,0,0,.14);
+        }
+        .chat-messages .msg-own .oo-upload-track { background:rgba(255,255,255,.28); }
+        .chat-messages .oo-upload-track i {
+            display:block; height:100%; width:0%; border-radius:4px;
+            background:currentColor; opacity:.85; transition:width .18s ease;
+        }
+        .chat-messages .oo-upload-pct { font-size:.62rem; opacity:.75; min-width:30px; text-align:right; }
+        .chat-messages .msg.is-uploading .oo-media-wrap { filter:brightness(.9); }
+        /* Tam ekran medya görüntüleyici */
+        .oo-viewer {
+            position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,.94);
+            display:flex; align-items:center; justify-content:center; padding:16px;
+            animation:ooViewerIn .16s ease;
+        }
+        .oo-viewer.hidden { display:none; }
+        @keyframes ooViewerIn { from { opacity:0 } to { opacity:1 } }
+        .oo-viewer .oo-viewer-body { max-width:100%; max-height:100%; display:flex; }
+        .oo-viewer img, .oo-viewer video {
+            max-width:100%; max-height:88vh; border-radius:10px; object-fit:contain; background:#000;
+        }
+        .oo-viewer .oo-viewer-close {
+            position:absolute; top:14px; right:14px; width:40px; height:40px; border:none;
+            border-radius:50%; background:rgba(255,255,255,.14); color:#fff; font-size:1.05rem;
+            cursor:pointer; display:flex; align-items:center; justify-content:center;
+        }
+        /* Kamera modalı */
+        .oo-cam {
+            position:fixed; inset:0; z-index:10000; background:#000; display:flex;
+            flex-direction:column; align-items:center; justify-content:center;
+        }
+        .oo-cam.hidden { display:none; }
+        .oo-cam video { width:100%; height:100%; object-fit:cover; position:absolute; inset:0; }
+        .oo-cam-top {
+            position:absolute; top:0; left:0; right:0; display:flex; align-items:center;
+            justify-content:space-between; padding:14px 16px; z-index:2;
+        }
+        .oo-cam-btn {
+            width:42px; height:42px; border:none; border-radius:50%; cursor:pointer;
+            background:rgba(255,255,255,.16); color:#fff; font-size:1rem;
+            display:flex; align-items:center; justify-content:center;
+        }
+        .oo-cam-bottom {
+            position:absolute; bottom:0; left:0; right:0; z-index:2; padding:22px 18px 30px;
+            display:flex; align-items:center; justify-content:space-between; gap:16px;
+            background:linear-gradient(to top, rgba(0,0,0,.55), transparent);
+        }
+        .oo-cam-shutter {
+            width:74px; height:74px; border-radius:50%; border:5px solid rgba(255,255,255,.85);
+            background:rgba(255,255,255,.25); cursor:pointer; transition:background .15s, transform .12s;
+        }
+        .oo-cam-shutter:active { transform:scale(.94); }
+        .oo-cam.recording .oo-cam-shutter { background:#ef4444; border-color:#fca5a5; }
+        .oo-cam-hint { color:#fff; font-size:.72rem; opacity:.8; text-align:center; flex:1; }
+        .oo-cam-timer {
+            position:absolute; top:64px; left:50%; transform:translateX(-50%); z-index:3;
+            color:#fff; font-size:.8rem; background:rgba(239,68,68,.85); padding:3px 10px;
+            border-radius:20px; display:none;
+        }
+        .oo-cam.recording .oo-cam-timer { display:block; }
+
         .chat-messages .msg-bubble.has-media .msg-meta { padding:2px 6px 1px; }
         .chat-messages .msg-bubble .msg-meta {
             display:flex; align-items:center; gap:6px; justify-content:flex-end;
@@ -2010,11 +2102,49 @@
     (function(){
       'use strict';
       var vv = window.visualViewport;
+      // Uygulama bir iframe içinde çalışıyorsa (GüneşOS penceresi), klavye
+      // yalnızca ÜST pencerenin görünür alanını küçültür; iframe kendi
+      // yüksekliğini korur ve tarayıcı sayfayı kaydırdığı için sohbet başlığı
+      // ekranın dışına çıkar. Bu yüzden üst pencerenin visualViewport'unu da
+      // hesaba katıp, iframe'in gerçekten görünen bölümünü kullanıyoruz.
+      function topCtx(){
+        try {
+          if (window.parent && window.parent !== window && window.frameElement) {
+            var tw = window.top;
+            // Same-origin erişim testi
+            void tw.document;
+            return { win: tw, vv: tw.visualViewport, frame: window.frameElement };
+          }
+        } catch (e) { /* cross-origin: yok say */ }
+        return null;
+      }
       function applyH(){
         var h = vv ? vv.height : window.innerHeight;
-        var top = vv ? (vv.offsetTop || 0) : 0;
+        var offTop = vv ? (vv.offsetTop || 0) : 0;
+
+        var ctx = topCtx();
+        if (ctx) {
+          var tvv = ctx.vv;
+          var visTop = tvv ? (tvv.offsetTop || 0) : 0;
+          var visBottom = visTop + (tvv ? tvv.height : ctx.win.innerHeight);
+          var r = ctx.frame.getBoundingClientRect();
+          var top2 = Math.max(r.top, visTop);
+          var bottom2 = Math.min(r.bottom, visBottom);
+          var avail = bottom2 - top2;
+          if (avail > 120) {
+            h = avail;
+            offTop = Math.max(0, top2 - r.top);
+          }
+          // Klavye açılınca tarayıcı üst dokümanı kaydırabilir; geri al.
+          try {
+            if (ctx.win.pageYOffset || (ctx.win.document.documentElement || {}).scrollTop) {
+              ctx.win.scrollTo(0, 0);
+            }
+          } catch (e) {}
+        }
+
         document.documentElement.style.setProperty('--app-h', h + 'px');
-        document.body.style.top = top + 'px';
+        document.body.style.top = offTop + 'px';
         // Tarayıcı klavye açılınca tüm sayfayı kaydırıyor; geri al ki başlık sabit kalsın.
         if (window.pageYOffset || document.documentElement.scrollTop) {
           try { window.scrollTo(0, 0); } catch(e){}
@@ -2022,7 +2152,8 @@
         var box = document.getElementById('chatMessages');
         if (box && document.getElementById('screen-chat') &&
             !document.getElementById('screen-chat').classList.contains('hidden-screen')) {
-          box.scrollTop = box.scrollHeight;
+          if (typeof window.ooPinChatBottom === 'function') window.ooPinChatBottom(box);
+          else box.scrollTop = box.scrollHeight;
         }
       }
       applyH();
@@ -2030,14 +2161,33 @@
       window.addEventListener('resize', applyH);
       window.addEventListener('scroll', function(){ applyH(); }, { passive: true });
       window.addEventListener('orientationchange', function(){ setTimeout(applyH, 250); });
+
+      // Üst penceredeki klavye olaylarını da dinle
+      (function bindTop(){
+        var ctx = topCtx();
+        if (!ctx) return;
+        try {
+          if (ctx.vv) {
+            ctx.vv.addEventListener('resize', applyH);
+            ctx.vv.addEventListener('scroll', applyH);
+          }
+          ctx.win.addEventListener('resize', applyH);
+          ctx.win.addEventListener('scroll', applyH, { passive: true });
+        } catch (e) {}
+      })();
+
+      function nudge(){
+        [0, 60, 120, 250, 400, 650].forEach(function(ms){ setTimeout(applyH, ms); });
+      }
       document.addEventListener('focusin', function(e){
         if (e.target && (e.target.id === 'chatInput' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT')) {
-          setTimeout(applyH, 120); setTimeout(applyH, 350);
+          nudge();
         }
       });
-      document.addEventListener('focusout', function(){ setTimeout(applyH, 120); setTimeout(applyH, 350); });
+      document.addEventListener('focusout', nudge);
 
     })();
+
     </script>
     <script>
 
